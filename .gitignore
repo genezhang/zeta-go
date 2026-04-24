@@ -2,6 +2,7 @@
 *.test
 *.out
 /embedded/embedded.test
+/cmd/zeta-setup/zeta-setup
 
 # IDE
 .idea/
@@ -10,8 +11,3 @@
 
 # OS
 .DS_Store
-
-# Fetched native library artifacts — downloaded by `go run ./cmd/zeta-setup`
-# or similar; not checked in (see README for distribution details).
-/embedded/internal/lib/**/*.a
-!/embedded/internal/lib/.keep

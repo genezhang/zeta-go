@@ -3,5 +3,5 @@
 package embedded
 
 // #cgo CFLAGS: -I${SRCDIR}/include
-// #cgo LDFLAGS: ${SRCDIR}/internal/lib/darwin_arm64/libzeta.a -lc++ -framework CoreFoundation -framework Security -framework SystemConfiguration
+// #cgo LDFLAGS: /usr/local/lib/zeta/libzeta.a -lc++ -framework CoreFoundation -framework Security -framework SystemConfiguration
 import "C"
