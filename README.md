@@ -4,7 +4,7 @@ Go bindings for [Zeta](https://github.com/genezhang/zeta) — a PostgreSQL-diale
 database engine with JSONB, vector similarity, property graphs, and SSI
 transactions.
 
-Zeta ships in three form factors. This repository covers only one of them
+Zeta ships in three form factors. This repository covers the embedded one
 directly; the other two are served by the existing Go Postgres / MySQL
 ecosystem because Zeta's servers speak both wire protocols on the same
 database.
@@ -15,46 +15,78 @@ database.
 | **Single-node server** | Any Postgres or MySQL Go driver |
 | **Distributed servers** | Any Postgres or MySQL Go driver |
 
-## Embedded: in-process database
+## Embedded usage
 
-In-process usage via cgo. Zero-network overhead; the database runs inside
-your Go binary.
+```go
+import "github.com/genezhang/zeta-go/embedded"
 
-> **Status:** scaffolding phase. The package currently exposes only
-> `Version()` as a link-verification smoke test. The full API (`Open`,
-> `Execute`, `Query`, transactions, vector binding, schema introspection)
-> is planned — see the issue tracker.
+db, err := embedded.OpenMemory()
+if err != nil { log.Fatal(err) }
+defer db.Close()
 
-### Install
+// DDL
+if _, err := db.Exec(`CREATE TABLE users (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    embedding VECTOR(3)
+)`); err != nil { log.Fatal(err) }
+
+// Transaction with DML
+tx, err := db.Begin()
+if err != nil { log.Fatal(err) }
+defer tx.Rollback()               // no-op if Commit succeeds
+
+if _, err := tx.Exec(
+    "INSERT INTO users VALUES ($1, $2, $3)",
+    1, "alice", []float32{1.0, 0.0, 0.0},
+); err != nil { log.Fatal(err) }
+
+if err := tx.Commit(); err != nil { log.Fatal(err) }
+
+// Query
+rows, err := db.Query("SELECT id, name FROM users WHERE id = $1", 1)
+if err != nil { log.Fatal(err) }
+defer rows.Close()
+
+for rows.Next() {
+    var id int64
+    var name string
+    if err := rows.Scan(&id, &name); err != nil { log.Fatal(err) }
+    fmt.Println(id, name)
+}
+if err := rows.Err(); err != nil { log.Fatal(err) }
+```
+
+See [`examples/embedded`](examples/embedded/main.go) for a runnable program.
+
+### Install the native library
 
 `libzeta.a` is a 40–115 MB precompiled archive per platform — too large
-to vendor in the Go module (linux-amd64 alone exceeds GitHub's 100 MB
-per-file limit). Install it once via the bundled `zeta-setup` tool:
+to vendor in the Go module. Install it once via the bundled `zeta-setup`
+tool:
 
 ```bash
 go install github.com/genezhang/zeta-go/cmd/zeta-setup@latest
 sudo zeta-setup install
 ```
 
-`zeta-setup` downloads the matching artifact for your `GOOS/GOARCH` from
-the zeta-go GitHub Releases page, verifies its sha256 checksum, and
-installs it to `/usr/local/lib/zeta/libzeta.a`. The `embedded` package's
-cgo preamble references that path.
+This downloads the matching artifact for your `GOOS/GOARCH` from the
+zeta-go GitHub Releases page, verifies its sha256 checksum, and places
+it at `/usr/local/lib/zeta/libzeta.a`. The `embedded` package's cgo
+preamble references that path.
 
-To install without sudo, use `-prefix`:
+Without sudo, use `-prefix`:
 
 ```bash
 zeta-setup install -prefix $HOME/.local
-# then, before building, set:
-export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt"  # Linux
-# or on macOS:
-export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lc++ -framework CoreFoundation -framework Security -framework SystemConfiguration"
+# Linux: set before building
+export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt"
 ```
 
 Other commands:
 
 ```bash
-zeta-setup version              # show installed version
+zeta-setup version              # print installed version
 zeta-setup install -force       # reinstall
 zeta-setup install -version v0.2.0
 zeta-setup uninstall
@@ -63,13 +95,86 @@ zeta-setup uninstall
 Platforms: `linux-{amd64,arm64}` and `darwin-{amd64,arm64}`. Windows is
 not supported.
 
-### Use
+### API reference
+
+#### Type: `*Database`
+```go
+embedded.Open(path string) (*Database, error)   // file or ":memory:"
+embedded.OpenMemory() (*Database, error)
+
+(*Database).Close() error
+(*Database).Exec(sql string, params ...any) (Result, error)
+(*Database).Query(sql string, params ...any) (*Rows, error)
+(*Database).Begin() (*Tx, error)
+(*Database).ListTables() ([]string, error)
+(*Database).TableInfo(name string) (*TableInfo, error)
+
+embedded.Version() string
+```
+
+#### Type: `*Tx`
+```go
+(*Tx).Exec(sql string, params ...any) (Result, error)
+(*Tx).Query(sql string, params ...any) (*Rows, error)
+(*Tx).Commit() error
+(*Tx).Rollback() error    // idempotent; safe to defer after Commit
+```
+
+#### Type: `*Rows`
+```go
+(*Rows).Next() bool           // auto-closes on false
+(*Rows).Scan(dest ...any) error
+(*Rows).Columns() []string    // populated after first Next
+(*Rows).Err() error
+(*Rows).Close() error
+```
+
+#### Supported parameter / scan types
+
+| SQL type | Bind Go type | Scan Go type |
+|---|---|---|
+| NULL | `nil` | `*any` (→ nil) |
+| BOOLEAN | `bool` | `*bool` |
+| SMALLINT / INTEGER / BIGINT | `int`, `int32`, `int64`, `uint`, `uint32`, `uint64` | `*int`, `*int32`, `*int64` |
+| REAL / DOUBLE PRECISION | `float32`, `float64` | `*float32`, `*float64` |
+| TEXT / VARCHAR | `string` | `*string` |
+| BYTEA | `[]byte` | `*string` (returned as Postgres hex `\x010203`) |
+| VECTOR(n) | `[]float32` | `*string` (returned as `[1,2,3]`) |
+
+`*any` is always supported — the concrete type depends on the column's
+Zeta type at runtime (see `embedded.ColumnInfo`).
+
+#### Errors
 
 ```go
-import "github.com/genezhang/zeta-go/embedded"
+type Error struct {
+    Kind    ErrorKind
+    Message string
+}
 
-v := embedded.Version()  // "0.1.0"
+// Kinds: ErrParse, ErrType, ErrConstraint, ErrConflict,
+//        ErrNotFound, ErrStorage, ErrUnknown
 ```
+
+Use `errors.As` to inspect Kind for retry logic (e.g. retry on
+`ErrConflict`):
+
+```go
+var ze *embedded.Error
+if errors.As(err, &ze) && ze.Kind == embedded.ErrConflict {
+    // retry the transaction
+}
+```
+
+### Concurrency
+
+`*Database` is safe for concurrent use by multiple goroutines. All
+operations serialise through an internal mutex; for parallelism, open
+separate `*Database` handles.
+
+An open `*Rows` or `*Tx` holds the database mutex until closed /
+committed / rolled back. Iterate `Rows` to completion (Next returning
+false auto-closes) and always defer Close/Rollback.
 
 ## Single-node or distributed server: use pgx or go-sql-driver/mysql
 
