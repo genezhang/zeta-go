@@ -8,6 +8,7 @@
 package embedded
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -47,6 +48,54 @@ func waitTCPReady(t *testing.T, addr string, deadline time.Duration) {
 	t.Fatalf("listener at %s never became reachable within %s", addr, deadline)
 }
 
+// startPgwireOnEphemeralPort picks a port and starts a pgwire listener,
+// retrying a handful of times to absorb the inherent race between the
+// OS releasing our probe socket and StartPgwireDev binding (another
+// process can grab the port in between). Returns the bound address.
+func startPgwireOnEphemeralPort(t *testing.T, db *Database) string {
+	t.Helper()
+	const attempts = 5
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		port := pickEphemeralPort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		if err := db.StartPgwireDev(addr); err == nil {
+			return addr
+		} else {
+			lastErr = err
+		}
+	}
+	t.Fatalf("StartPgwireDev failed after %d attempts: %v", attempts, lastErr)
+	return ""
+}
+
+// runPsql invokes psql against the dev listener with stdout/stderr
+// captured separately. -X skips ~/.psqlrc so per-user prompt or pager
+// settings can't pollute parsed output.
+func runPsql(t *testing.T, port int, sql string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx,
+		"psql",
+		"-X",
+		"-h", "127.0.0.1",
+		"-p", strconv.Itoa(port),
+		"-U", "zeta",
+		"-d", "zeta",
+		"-t", "-A",
+		"-c", sql,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%v\n--- stderr ---\n%s--- stdout ---\n%s",
+			err, stderr.String(), stdout.String())
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 func TestDevListener_PsqlEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("psql"); err != nil {
 		t.Skip("psql not on PATH; skipping end-to-end dev-listener test")
@@ -65,47 +114,29 @@ func TestDevListener_PsqlEndToEnd(t *testing.T) {
 		t.Fatalf("INSERT: %v", err)
 	}
 
-	port := pickEphemeralPort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if err := db.StartPgwireDev(addr); err != nil {
-		t.Fatalf("StartPgwireDev(%s): %v", addr, err)
-	}
+	addr := startPgwireOnEphemeralPort(t, db)
 	waitTCPReady(t, addr, 5*time.Second)
 
-	// Drive psql against the in-process database. -t -A strips headers
-	// and field separators so the output is just the row value.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx,
-		"psql",
-		"-h", "127.0.0.1",
-		"-p", strconv.Itoa(port),
-		"-U", "zeta",
-		"-d", "zeta",
-		"-t", "-A",
-		"-c", "SELECT label FROM smoke WHERE id = 1",
-	).CombinedOutput()
+	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		t.Fatalf("psql failed: %v\n--- output ---\n%s", err, out)
+		t.Fatalf("SplitHostPort(%s): %v", addr, err)
 	}
-	got := strings.TrimSpace(string(out))
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port %q: %v", portStr, err)
+	}
+
+	got, err := runPsql(t, port, "SELECT label FROM smoke WHERE id = 1")
+	if err != nil {
+		t.Fatalf("psql SELECT failed: %v", err)
+	}
 	if got != "via-embedded-api" {
-		t.Fatalf("psql returned %q, want %q\n--- full output ---\n%s",
-			got, "via-embedded-api", out)
+		t.Fatalf("psql returned %q, want %q", got, "via-embedded-api")
 	}
 
 	// Round-trip the other direction: write via psql, read via embedded API.
-	out, err = exec.CommandContext(ctx,
-		"psql",
-		"-h", "127.0.0.1",
-		"-p", strconv.Itoa(port),
-		"-U", "zeta",
-		"-d", "zeta",
-		"-t", "-A",
-		"-c", "INSERT INTO smoke VALUES (2, 'via-psql')",
-	).CombinedOutput()
-	if err != nil {
-		t.Fatalf("psql INSERT failed: %v\n--- output ---\n%s", err, out)
+	if _, err := runPsql(t, port, "INSERT INTO smoke VALUES (2, 'via-psql')"); err != nil {
+		t.Fatalf("psql INSERT failed: %v", err)
 	}
 
 	rows, err := db.Query("SELECT label FROM smoke WHERE id = 2")
