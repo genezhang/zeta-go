@@ -192,9 +192,10 @@ go build -tags zeta_dev ./...
 db, _ := embedded.OpenMemory()
 defer db.Close()
 
-// Loopback only by default. Pass ":0" to let the OS pick a port —
-// the chosen port is logged to stderr at INFO level via the engine's
-// tracing output.
+// Loopback only by default. Pass "127.0.0.1:0" to let the OS pick a
+// port — the chosen port is logged to stderr at INFO level via the
+// engine's tracing output. (Bare ":0" binds all interfaces and is
+// rejected by the loopback-only check.)
 if err := db.StartPgwireDev("127.0.0.1:5433"); err != nil {
     log.Fatal(err)
 }

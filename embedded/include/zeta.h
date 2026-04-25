@@ -501,8 +501,10 @@ int zeta_start_mysqlwire(zeta_db_t *db, const char *addr, char **err_msg);
  * `zeta_close` invokes this internally; explicit use is for callers
  * that want to take down listeners without closing the database.
  *
- * Returns ZETA_OK or a negative error code.  Available whenever
- * either of the wire features is compiled in.
+ * Returns ZETA_OK or a negative error code.  The declaration is
+ * visible in this header only when ZETA_DEV_LISTENERS is defined
+ * (same gate as the start functions); the symbol is exported by
+ * libzeta.a whenever either wire feature is compiled in.
  */
 int zeta_stop_listeners(zeta_db_t *db);
 

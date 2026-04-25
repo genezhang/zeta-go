@@ -33,11 +33,16 @@ import (
 	"unsafe"
 )
 
-// ErrDevListenersNotBuilt is returned when libzeta.a was compiled
-// without the wire features. Detection is at link time on the C side
-// (an attempt to call the entry points fails to link); this sentinel
-// is provided for callers that wish to surface a Go-level error
-// instead of relying on the linker message — see the README.
+// ErrDevListenersNotBuilt documents the failure mode when libzeta.a
+// was built without the wire features.
+//
+// In this build configuration the dev-listener entry points are bound
+// directly from C, so a library missing those symbols fails at link
+// time before any Go code can run — the methods in this file do not
+// return this sentinel. It is kept only as a stable error value for
+// callers / documentation that want to describe that case (e.g. a
+// build script that catches the linker error and surfaces a friendlier
+// Go-level message).
 var ErrDevListenersNotBuilt = errors.New(
 	"zeta: dev-listeners not built into libzeta.a (rebuild with --features dev-listeners)",
 )
