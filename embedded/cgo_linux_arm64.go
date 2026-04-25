@@ -3,5 +3,5 @@
 package embedded
 
 // #cgo CFLAGS: -I${SRCDIR}/include
-// #cgo LDFLAGS: /usr/local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt
+// #cgo LDFLAGS: /usr/local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt -lz
 import "C"
