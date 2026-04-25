@@ -449,6 +449,65 @@ int zeta_use_voyage_embed(
     char **err_msg
 );
 
+/* ── Embedded wire-protocol listeners (developer-inspection facility) ─────── */
+
+/*
+ * Optional: gated on the `wire-pg` / `wire-mysql` / `dev-listeners` Cargo
+ * features in zeta-embedded-c, and on the matching ZETA_DEV_LISTENERS
+ * macro in this header. Define ZETA_DEV_LISTENERS before including
+ * zeta.h to expose the declarations; they are linkable only against a
+ * libzeta built with the corresponding feature.
+ *
+ * Lets a developer using the embedded form factor open a TCP socket
+ * that standard PostgreSQL or MySQL clients (psql, mysql CLI,
+ * Workbench, etc.) can connect to, exposing the in-process database
+ * for ad-hoc inspection.
+ *
+ * NOT FOR PRODUCTION USE. The listeners default to:
+ *   - loopback-only bind addresses (rejected unless
+ *     ZETA_ALLOW_NONLOCAL_EMBED_LISTEN=1 is set in the environment),
+ *   - trust authentication (no password),
+ *   - in-memory replication slots (pgwire).
+ *
+ * For a real network-accessible Zeta server, run zeta-server-bin.
+ */
+
+#ifdef ZETA_DEV_LISTENERS
+
+/**
+ * Start a PostgreSQL wire-protocol listener serving `db`.
+ *
+ * `addr` is a TCP bind string ("127.0.0.1:5433" by convention).  The
+ * listener spawns onto the embedded database's Tokio runtime.
+ *
+ * Returns ZETA_OK on success or a negative error code on failure.
+ * `err_msg` (if non-NULL) receives a newly-allocated error string on
+ * failure — free with zeta_free().
+ *
+ * Requires libzeta built with the `wire-pg` (or `dev-listeners`) feature.
+ */
+int zeta_start_pgwire(zeta_db_t *db, const char *addr, char **err_msg);
+
+/**
+ * Start a MySQL wire-protocol listener serving `db`.  Same loopback
+ * restriction and developer-only caveats as zeta_start_pgwire.
+ *
+ * Requires libzeta built with the `wire-mysql` (or `dev-listeners`) feature.
+ */
+int zeta_start_mysqlwire(zeta_db_t *db, const char *addr, char **err_msg);
+
+/**
+ * Stop and drain all wire-protocol listeners associated with `db`.
+ * `zeta_close` invokes this internally; explicit use is for callers
+ * that want to take down listeners without closing the database.
+ *
+ * Returns ZETA_OK or a negative error code.  Available whenever
+ * either of the wire features is compiled in.
+ */
+int zeta_stop_listeners(zeta_db_t *db);
+
+#endif /* ZETA_DEV_LISTENERS */
+
 /* ── Miscellaneous ─────────────────────────────────────────────────────────── */
 
 /**

@@ -176,6 +176,53 @@ An open `*Rows` or `*Tx` holds the database mutex until closed /
 committed / rolled back. Iterate `Rows` to completion (Next returning
 false auto-closes) and always defer Close/Rollback.
 
+### Inspecting an embedded database with psql / mysql (dev only)
+
+An in-process Zeta database can optionally expose itself on a loopback
+port so a developer can attach `psql`, `mysql`, DBeaver, MySQL
+Workbench, or any other standard client for inspection / debugging.
+The facility is gated on a build tag because it is **not for
+production**:
+
+```bash
+go build -tags zeta_dev ./...
+```
+
+```go
+db, _ := embedded.OpenMemory()
+defer db.Close()
+
+// Loopback only by default. Pass ":0" to let the OS pick a port —
+// the chosen port is logged to stderr at INFO level via the engine's
+// tracing output.
+if err := db.StartPgwireDev("127.0.0.1:5433"); err != nil {
+    log.Fatal(err)
+}
+if err := db.StartMysqlwireDev("127.0.0.1:3307"); err != nil {
+    log.Fatal(err)
+}
+
+// ... run application logic in-process ...
+// Connect from another terminal:
+//   psql  -h 127.0.0.1 -p 5433 -U zeta
+//   mysql -h 127.0.0.1 -P 3307 -u zeta
+```
+
+`db.Close()` drains both listeners; explicit `db.StopDevListeners()`
+takes them down without closing the database.
+
+**Caveats**:
+- Defaults to loopback only. Set `ZETA_ALLOW_NONLOCAL_EMBED_LISTEN=1`
+  in the environment to bypass the check (developer use only).
+- Trust authentication. SCRAM/TLS support is deferred.
+- Replication slots are kept in memory only.
+- Requires `libzeta.a` built with the `wire-pg` / `wire-mysql` /
+  `dev-listeners` Cargo features. The default `zeta-setup install`
+  artifact today is *not* built with these features; rebuild from
+  source or wait for a release that bundles them. Building with
+  `-tags zeta_dev` against a stock `libzeta.a` produces a linker
+  error pointing at `zeta_start_pgwire` / `zeta_start_mysqlwire`.
+
 ## Single-node or distributed server: use pgx or go-sql-driver/mysql
 
 Zeta's server speaks **both PostgreSQL and MySQL wire protocols
