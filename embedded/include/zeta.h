@@ -140,6 +140,15 @@ int zeta_bind_int64(zeta_stmt_t *stmt, int idx, int64_t val);
 int zeta_bind_int32(zeta_stmt_t *stmt, int idx, int32_t val);
 
 /**
+ * Bind a SQL boolean to parameter idx (1-based). Any nonzero `val` is true.
+ *
+ * Use this rather than zeta_bind_int32 for BOOLEAN columns/parameters so the
+ * value is stored and read back as a boolean (true/false) rather than 1/0.
+ * Returns ZETA_OK or error.
+ */
+int zeta_bind_bool(zeta_stmt_t *stmt, int idx, int val);
+
+/**
  * Bind a double to parameter idx (1-based). Returns ZETA_OK or error.
  */
 int zeta_bind_double(zeta_stmt_t *stmt, int idx, double val);
