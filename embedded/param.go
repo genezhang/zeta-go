@@ -36,11 +36,11 @@ func bindOne(stmt *C.zeta_stmt_t, idx C.int, p any) (C.int, error) {
 	case nil:
 		return C.zeta_bind_null(stmt, idx), nil
 	case bool:
-		var n C.int32_t
+		var n C.int
 		if v {
 			n = 1
 		}
-		return C.zeta_bind_int32(stmt, idx, n), nil
+		return C.zeta_bind_bool(stmt, idx, n), nil
 	case int:
 		return C.zeta_bind_int64(stmt, idx, C.int64_t(v)), nil
 	case int32:
