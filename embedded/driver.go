@@ -51,7 +51,16 @@ func init() {
 //     no equivalent of sqlite3_interrupt).
 //   - Named parameters are not supported — use positional $1, $2, ....
 //   - LastInsertId is unsupported; use INSERT ... RETURNING.
-//   - time.Time parameters are bound as UTC, microsecond-precision text.
+//   - time.Time parameters are bound as UTC, microsecond-precision timestamp
+//     text. That binds into TIMESTAMP and TIMESTAMPTZ columns, but the engine
+//     does not yet accept timestamp text for DATE or TIME (genezhang/zeta#3935),
+//     so a DATE or TIME value read back cannot be passed as a parameter; bind
+//     it as a string ("2006-01-02", "15:04:05.999999") instead.
+//   - With an archive carrying the typed temporal codes (zeta-embedded#86),
+//     TIMESTAMP / TIMESTAMPTZ / DATE / TIME columns read as time.Time (UTC).
+//     Scanning one into *int64 then fails, and into *string yields
+//     database/sql's RFC 3339 rendering; the native [Rows.Scan] into *string
+//     still returns the engine's own text.
 type Driver struct{}
 
 var (

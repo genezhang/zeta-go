@@ -124,7 +124,12 @@ var ErrNoRow = errors.New("zeta: Scan called without a current row (call Next fi
 // Each destination must be a pointer to a supported type:
 //
 //	*bool, *int, *int32, *int64, *float32, *float64, *string,
-//	*[]byte, *[]float32, *any, *sql.NullXxx-style Scanner (not yet supported)
+//	*[]byte, *[]float32, *time.Time, *any,
+//	*sql.NullXxx-style Scanner (not yet supported)
+//
+// *time.Time needs a TIMESTAMP, TIMESTAMPTZ, DATE or TIME column read from an
+// archive that carries the typed temporal codes; older archives report those
+// columns as integers.
 //
 // The number of destinations must equal the number of columns.
 func (r *Rows) Scan(dest ...any) error {
@@ -197,7 +202,8 @@ func scanColumn(stmt *C.zeta_stmt_t, i C.int, dest any) error {
 		}
 		v, ok := columnToAny(stmt, i, ctype).(time.Time)
 		if !ok {
-			return fmt.Errorf("column %d is not a date/time type (code %d)", int(i), int(ctype))
+			return fmt.Errorf("not a date/time column (type code %d; an archive "+
+				"older than the temporal codes reports dates as integers, code 1)", int(ctype))
 		}
 		*d = v
 	case *[]byte:
