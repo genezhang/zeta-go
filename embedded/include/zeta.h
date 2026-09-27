@@ -68,6 +68,30 @@ extern "C" {
 #define ZETA_TYPE_BLOB   4
 /** SQL BOOLEAN. Read with zeta_column_int64() — returns 0 (false) or 1 (true). */
 #define ZETA_TYPE_BOOL   5
+/*
+ * Typed-text codes: read with zeta_column_text(); the code says what the text
+ * means. An unknown code must be read as text, never as NULL.
+ */
+/** SQL NUMERIC / DECIMAL, in the column's scale ("3.50"). */
+#define ZETA_TYPE_DECIMAL  6
+/** SQL UUID, lowercase hyphenated. */
+#define ZETA_TYPE_UUID     7
+/** SQL JSONB, and any SQL array (as a JSON array). Compact JSON text. */
+#define ZETA_TYPE_JSON     8
+/** SQL VECTOR(n), as "[0.5,0.25]". */
+#define ZETA_TYPE_VECTOR   9
+/*
+ * Temporal codes: zeta_column_int64() returns the raw payload below;
+ * zeta_column_text() returns ISO 8601. Older archives report ZETA_TYPE_INT.
+ */
+/** SQL TIMESTAMP: µs since 1970-01-01T00:00:00. */
+#define ZETA_TYPE_TIMESTAMP   10
+/** SQL TIMESTAMPTZ: µs since the Unix epoch, UTC. */
+#define ZETA_TYPE_TIMESTAMPTZ 11
+/** SQL DATE: days since 1970-01-01. */
+#define ZETA_TYPE_DATE        12
+/** SQL TIME: µs since midnight. */
+#define ZETA_TYPE_TIME        13
 
 /* ── Opaque handle types ───────────────────────────────────────────────────── */
 

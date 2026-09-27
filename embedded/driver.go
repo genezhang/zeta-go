@@ -462,7 +462,8 @@ func bindValues(h *C.zeta_stmt_t, args []driver.Value) error {
 }
 
 // columnToValue reads column i as a driver.Value. columnToAny already returns
-// only int64/float64/string/[]byte/bool/nil, all valid driver.Value types.
+// only int64/float64/string/[]byte/bool/time.Time/nil, all valid driver.Value
+// types.
 func columnToValue(h *C.zeta_stmt_t, i C.int) driver.Value {
 	return columnToAny(h, i, C.zeta_column_type(h, i))
 }
