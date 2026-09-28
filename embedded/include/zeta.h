@@ -61,13 +61,55 @@ extern "C" {
 
 /* ── Column type codes ─────────────────────────────────────────────────────── */
 
-#define ZETA_TYPE_NULL   0
-#define ZETA_TYPE_INT    1
-#define ZETA_TYPE_FLOAT  2
-#define ZETA_TYPE_TEXT   3
-#define ZETA_TYPE_BLOB   4
+/*
+ * Values returned by zeta_column_type(). 0-4 are the SQLite-style classes;
+ * 5 and up are Zeta extensions with no SQLite equivalent.
+ *
+ * Every code is readable through zeta_column_text(): the typed codes 6-9 add
+ * no accessor of their own, they say what the text *means*. Codes 10-13 are
+ * also readable through zeta_column_int64(). The list may grow;
+ * treat any code you do not recognise as text and read it with
+ * zeta_column_text() rather than as NULL.
+ */
+#define ZETA_TYPE_NULL     0
+#define ZETA_TYPE_INT      1
+#define ZETA_TYPE_FLOAT    2
+#define ZETA_TYPE_TEXT     3
+#define ZETA_TYPE_BLOB     4
 /** SQL BOOLEAN. Read with zeta_column_int64() — returns 0 (false) or 1 (true). */
-#define ZETA_TYPE_BOOL   5
+#define ZETA_TYPE_BOOL     5
+/**
+ * SQL NUMERIC / DECIMAL. zeta_column_text() yields the decimal string in the
+ * scale the engine holds — "3.50" from DECIMAL(10,2) — not the shortest float
+ * that round-trips. zeta_column_int64() / zeta_column_double() return 0.
+ */
+#define ZETA_TYPE_DECIMAL  6
+/** SQL UUID, as lowercase hyphenated text. */
+#define ZETA_TYPE_UUID     7
+/**
+ * SQL JSONB, and any SQL array (rendered as a JSON array). Compact JSON text.
+ * A JSONB value nested more than 127 containers deep reports ZETA_TYPE_TEXT
+ * instead, carrying the same JSON text.
+ */
+#define ZETA_TYPE_JSON     8
+/** SQL VECTOR(n), as the bracketed literal SQL uses: "[0.5,0.25]". */
+#define ZETA_TYPE_VECTOR   9
+/*
+ * Temporal types. Unlike 6-9 these also answer zeta_column_int64() (and
+ * zeta_column_double()) with the raw payload given below; zeta_column_text()
+ * yields ISO 8601. An archive older than these codes reports ZETA_TYPE_INT for
+ * all four with the same integer payload, so a reader that followed the
+ * "unknown code → text" rule above now gets ISO text where it used to get a
+ * number.
+ */
+/** SQL TIMESTAMP: µs since 1970-01-01T00:00:00. "2026-01-15T12:34:56.500000". */
+#define ZETA_TYPE_TIMESTAMP   10
+/** SQL TIMESTAMPTZ: µs since the Unix epoch, UTC. "2026-01-15T10:34:56.000000+00:00". */
+#define ZETA_TYPE_TIMESTAMPTZ 11
+/** SQL DATE: days since 1970-01-01. "2026-01-15". */
+#define ZETA_TYPE_DATE        12
+/** SQL TIME: µs since midnight. "12:34:56.250000". */
+#define ZETA_TYPE_TIME        13
 
 /* ── Opaque handle types ───────────────────────────────────────────────────── */
 

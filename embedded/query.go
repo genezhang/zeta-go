@@ -9,6 +9,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Query runs a SELECT statement and returns a Rows iterator. Call
@@ -123,7 +124,12 @@ var ErrNoRow = errors.New("zeta: Scan called without a current row (call Next fi
 // Each destination must be a pointer to a supported type:
 //
 //	*bool, *int, *int32, *int64, *float32, *float64, *string,
-//	*[]byte, *[]float32, *any, *sql.NullXxx-style Scanner (not yet supported)
+//	*[]byte, *[]float32, *time.Time, *any,
+//	*sql.NullXxx-style Scanner (not yet supported)
+//
+// *time.Time needs a TIMESTAMP, TIMESTAMPTZ, DATE or TIME column read from an
+// archive that carries the typed temporal codes; older archives report those
+// columns as integers.
 //
 // The number of destinations must equal the number of columns.
 func (r *Rows) Scan(dest ...any) error {
@@ -189,6 +195,17 @@ func scanColumn(stmt *C.zeta_stmt_t, i C.int, dest any) error {
 		} else {
 			*d = C.GoString(C.zeta_column_text(stmt, i))
 		}
+	case *time.Time:
+		if isNull {
+			*d = time.Time{}
+			return nil
+		}
+		v, ok := columnToAny(stmt, i, ctype).(time.Time)
+		if !ok {
+			return fmt.Errorf("not a date/time column (type code %d; an archive "+
+				"older than the temporal codes reports dates as integers, code 1)", int(ctype))
+		}
+		*d = v
 	case *[]byte:
 		if isNull {
 			*d = nil
@@ -230,7 +247,25 @@ func columnToAny(stmt *C.zeta_stmt_t, i C.int, ctype C.int) any {
 		return C.GoBytes(ptr, blen)
 	case C.ZETA_TYPE_BOOL:
 		return C.zeta_column_int64(stmt, i) != 0
+	// Temporal columns are time.Time, the type database/sql callers expect
+	// (and what go-sqlite3/pgx return). TIMESTAMPTZ is in UTC; TIMESTAMP and
+	// DATE are wall-clock values, also carried in UTC so they print as stored.
+	// TIME has no Go type; it is the time of day on 0000-01-01, UTC.
+	case C.ZETA_TYPE_TIMESTAMP, C.ZETA_TYPE_TIMESTAMPTZ:
+		return time.UnixMicro(int64(C.zeta_column_int64(stmt, i))).UTC()
+	case C.ZETA_TYPE_DATE:
+		return time.Unix(int64(C.zeta_column_int64(stmt, i))*86400, 0).UTC()
+	case C.ZETA_TYPE_TIME:
+		return time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC).
+			Add(time.Duration(C.zeta_column_int64(stmt, i)) * time.Microsecond)
 	default:
-		return nil
+		// DECIMAL / UUID / JSON / VECTOR, and any code newer than this
+		// reader: every code is readable as text (zeta.h), so an unknown one
+		// must not turn a real value into nil.
+		p := C.zeta_column_text(stmt, i)
+		if p == nil {
+			return nil
+		}
+		return C.GoString(p)
 	}
 }
