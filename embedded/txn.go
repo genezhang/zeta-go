@@ -36,9 +36,33 @@ type Tx struct {
 	done   bool
 }
 
-// Begin starts a new transaction. The returned Tx must be finalised with
-// Commit or Rollback.
+// Isolation is the isolation level of a transaction, chosen when it begins.
+type Isolation int
+
+const (
+	// IsolationSnapshot is snapshot isolation (PostgreSQL's REPEATABLE READ),
+	// the default of Begin: one consistent snapshot, and concurrent writes to
+	// the same row conflict, but two transactions that each read what the
+	// other writes can both commit (write skew).
+	IsolationSnapshot Isolation = C.ZETA_ISOLATION_SNAPSHOT
+	// IsolationSerializable is serializable snapshot isolation: write skew
+	// makes one transaction fail at Commit with an Error of Kind ErrConflict,
+	// and the caller retries the whole transaction. Conflict detection is
+	// coarse (two transactions touching only their own rows of one table can
+	// still abort one of them), so budget for retries.
+	IsolationSerializable Isolation = C.ZETA_ISOLATION_SERIALIZABLE
+)
+
+// Begin starts a new snapshot-isolation transaction. The returned Tx must be
+// finalised with Commit or Rollback.
 func (d *Database) Begin() (*Tx, error) {
+	return d.BeginWithIsolation(IsolationSnapshot)
+}
+
+// BeginWithIsolation starts a transaction at the given isolation level. The
+// level cannot be raised afterwards. For check-then-write logic use
+// IsolationSerializable and retry on ErrConflict.
+func (d *Database) BeginWithIsolation(level Isolation) (*Tx, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.handle == nil {
@@ -46,7 +70,7 @@ func (d *Database) Begin() (*Tx, error) {
 	}
 
 	var errMsg *C.char
-	h := C.zeta_begin(d.handle, &errMsg)
+	h := C.zeta_begin_isolation(d.handle, C.int(level), &errMsg)
 	if h == nil {
 		return nil, consumeErrMsg(errMsg, errorKindFromCode(int(C.zeta_errcode(d.handle))))
 	}
