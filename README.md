@@ -101,16 +101,33 @@ not supported.
 ```go
 embedded.Open(path string) (*Database, error)   // file or ":memory:"
 embedded.OpenMemory() (*Database, error)
+embedded.OpenMode(path string, mode Mode) (*Database, error)
 
 (*Database).Close() error
 (*Database).Exec(sql string, params ...any) (Result, error)
 (*Database).Query(sql string, params ...any) (*Rows, error)
-(*Database).Begin() (*Tx, error)
+(*Database).Begin() (*Tx, error)                                  // snapshot isolation
+(*Database).BeginWithIsolation(level Isolation) (*Tx, error)
 (*Database).ListTables() ([]string, error)
 (*Database).TableInfo(name string) (*TableInfo, error)
 
 embedded.Version() string
 ```
+
+`Open` uses the default backend (Quartz, OLTP profile), which does **not** start
+the columnar analytics tier. To opt in, `OpenMode(path, embedded.ModeQuartz|embedded.ModeFlagHTAP)`
+(also `ModeLSM`, `ModeMemory`); analytical SQL (aggregates, `GROUP BY`) then routes to it. The retired
+BTree backend (mode 0) is rejected, and a data directory opens only with the backend that created it.
+
+#### Isolation
+
+`Begin` is snapshot isolation: one consistent snapshot, and concurrent writes to the same row conflict,
+but two transactions that each read what the other writes can **both commit** (write skew). For
+check-then-write logic use `BeginWithIsolation(embedded.IsolationSerializable)`; a dangerous pattern then
+fails one transaction at `Commit` with an `*Error` of `Kind == ErrConflict`, and you retry the whole
+transaction. Conflict detection is coarse, so budget for retries. Through `database/sql`,
+`BeginTx` with `sql.LevelSerializable` does the same; `ReadCommitted`/`RepeatableRead`/`Snapshot` run at
+snapshot isolation, `sql.LevelLinearizable` is rejected, and `ReadOnly` is not enforced.
 
 #### Type: `*Tx`
 ```go

@@ -56,8 +56,37 @@ extern "C" {
 #define ZETA_ERR_NOT_FOUND   (-5)
 /** Storage / I/O error. */
 #define ZETA_ERR_STORAGE     (-6)
+/**
+ * Returned by zeta_olap_stats() when no OLAP engine is running (the database
+ * was opened without an analytical backend). Distinct from ZETA_OK with zero
+ * counters, which means the engine IS running but has served no analytical
+ * queries yet.
+ */
+#define ZETA_OLAP_ABSENT     (-7)
 /** Unknown / unclassified error. */
 #define ZETA_ERR_UNKNOWN     (-99)
+
+/* ── Storage backend selector (zeta_open_mode) ─────────────────────────────── */
+
+/**
+ * Backend codes for zeta_open_mode(). Plain zeta_open() uses ZETA_MODE_QUARTZ
+ * with the OLTP profile, which does NOT start the OLAP columnar engine.
+ * Analytics are opt-in: OR ZETA_MODE_FLAG_HTAP into any mode, e.g.
+ * (ZETA_MODE_QUARTZ | ZETA_MODE_FLAG_HTAP), to start the columnar tier. (The
+ * flag only has an effect in a build compiled with the `olap` feature.)
+ *
+ * ZETA_MODE_BTREE (0) is the retired BTree backend. The value stays reserved
+ * so old callers fail loudly rather than receive a different engine:
+ * zeta_open_mode() rejects it with an error. A data directory written by the
+ * BTree backend cannot be opened by any remaining backend; open it with the
+ * last release that shipped BTree.
+ */
+#define ZETA_MODE_BTREE   0   /* removed -- rejected */
+#define ZETA_MODE_LSM     1
+#define ZETA_MODE_QUARTZ  2
+#define ZETA_MODE_MEMORY  3
+/** Flag bit, OR-ed into a mode: also start the columnar analytics (OLAP) tier. */
+#define ZETA_MODE_FLAG_HTAP 0x100
 
 /* ── Column type codes ─────────────────────────────────────────────────────── */
 
@@ -128,6 +157,10 @@ typedef struct ZetaTxn  zeta_txn_t;
  * Pass ":memory:" for an in-memory database (SQLite convention).
  * On failure returns NULL; if `err_msg` is non-NULL it is set to a
  * newly-allocated error string — free with zeta_free().
+ *
+ * The write-ahead log is reclaimed automatically (about the newest 256 MiB is
+ * kept; nothing a restart needs is ever deleted); there is nothing to configure.
+ * See zeta_open_with_retention() only to change that.
  */
 zeta_db_t *zeta_open(const char *path, char **err_msg);
 
@@ -137,10 +170,128 @@ zeta_db_t *zeta_open(const char *path, char **err_msg);
 zeta_db_t *zeta_open_memory(char **err_msg);
 
 /**
+ * Open a database with an explicit storage backend (see ZETA_MODE_*).
+ *
+ * zeta_open() selects ZETA_MODE_QUARTZ with the OLTP profile, which does NOT
+ * start the OLAP columnar engine. OR ZETA_MODE_FLAG_HTAP into the mode to use
+ * analytical queries (OLAP/HTAP).
+ *
+ * A pure columnar table — CREATE TABLE t (...) WITH (table_kind='columnar') —
+ * needs the same thing, and more: the columnar store is its ONLY store, so it
+ * exists only where one was built. Without ZETA_MODE_FLAG_HTAP (including plain
+ * zeta_open) the CREATE is rejected rather than accepted-then-answered-empty;
+ * with the flag it is accepted. A columnar table also has no row-store machinery, so
+ * CREATE INDEX / FOREIGN KEY / UNIQUE / triggers on it are rejected, and
+ * reading it from the same statement's own transaction is refused (the tier is
+ * materialized at COMMIT). See docs/design/pure_columnar_table.md.
+ *
+ * `path` must be non-NULL for the persistent backends (LSM/QUARTZ); it is
+ * ignored for ZETA_MODE_MEMORY. An unknown mode or flag bit is rejected, and so
+ * is ZETA_MODE_BTREE. On failure returns
+ * NULL and, if `err_msg` is non-NULL, sets it to a newly-allocated string —
+ * free with zeta_free().
+ */
+zeta_db_t *zeta_open_mode(const char *path, int mode, char **err_msg);
+
+/**
+ * zeta_open_mode() with an explicit write-ahead-log retention (#4183).
+ *
+ * YOU NORMALLY DO NOT NEED THIS. zeta_open() and zeta_open_mode() already
+ * reclaim the log automatically: they keep about the newest 256 MiB of log and
+ * delete older segments once every consumer of the log (the row store's
+ * checkpoint, the columnar and full-text appliers, replication slots) has
+ * durably moved past them, so nothing a restart needs is ever deleted. Without
+ * this the log would grow with every write (a row rewritten a thousand times is
+ * a thousand log entries) and resident memory and reopen time with it. The
+ * database checkpoints itself when that is what holds the log back (at most once
+ * per 30 s), so the host never calls a checkpoint function.
+ *
+ * Call this only to change the tail or to keep the whole log:
+ *   log_retention_max_mb       0 = the default (256 MiB);
+ *                              UINT64_MAX = no cap, keep the whole log forever;
+ *                              otherwise that many MiB. Keep it well above 64:
+ *                              the active segment is never deleted, so the log
+ *                              can overshoot the cap by up to one segment.
+ *   log_retention_max_age_secs 0 = no age cap; otherwise sealed segments older
+ *                              than that are also eligible (either cap alone is
+ *                              enough to delete a segment).
+ * (0, 0) is exactly zeta_open_mode(). What reclaiming gives up is replay of
+ * entries older than the kept tail (point-in-time recovery, a replication
+ * consumer that has not consumed them). Replication slots of an embedded wire
+ * listener (zeta_start_pgwire, ZETA_DEV_LISTENERS builds) are kept in memory
+ * where retention cannot see them, so a CDC client connected to one is NOT held
+ * back: such a host should pass UINT64_MAX. Ignored for ZETA_MODE_MEMORY. Same
+ * path/mode/err_msg contract as zeta_open_mode().
+ */
+zeta_db_t *zeta_open_with_retention(const char *path, int mode,
+                                    uint64_t log_retention_max_mb,
+                                    uint64_t log_retention_max_age_secs,
+                                    char **err_msg);
+
+/**
+ * Open a new SESSION (connection) over the same engine as `db`.
+ *
+ * The embedded counterpart of duckdb_connect() over one duckdb_database: the
+ * storage engine and runtime are shared, but the returned handle owns its
+ * SESSION STATE — branch selection (zeta_set_branch), database selection, the
+ * error slot and the changes counter — starting at the defaults (main branch).
+ *
+ * Session state is per connection, as in SQLite (each sqlite3* carries its own
+ * per-connection PRAGMAs) and in Zeta's own pgwire (SET zeta_branch is keyed
+ * per connection). Handing ONE handle to two concurrent workers therefore gives
+ * them one shared branch pointer, and one worker's zeta_set_branch silently
+ * retargets the other's statements. Give each concurrent worker its own:
+ *
+ *   zeta_db_t *db = zeta_open(path, &err);
+ *   zeta_db_t *a  = zeta_connect(db, &err);
+ *   zeta_db_t *b  = zeta_connect(db, &err);
+ *   zeta_set_branch(a, "agent_a", &err);
+ *   zeta_set_branch(b, "agent_b", &err);   // does not disturb a
+ *
+ * Like a DuckDB connection, one session is thread-safe but serialized while
+ * querying, so prefer one session per thread.
+ *
+ * Close each session with zeta_close(); a session owns no wire listeners, so
+ * closing it never disturbs listeners started on the zeta_open handle. Close
+ * that handle last — it owns the engine every session borrows.
+ *
+ * Returns NULL (and sets err_msg, if non-NULL) when `db` is NULL.
+ */
+zeta_db_t *zeta_connect(zeta_db_t *db, char **err_msg);
+
+/**
  * Close a database handle and release all resources.
  * Passing NULL is a no-op.
+ *
+ * Also closes a session obtained from zeta_connect().
  */
 void zeta_close(zeta_db_t *db);
+
+/**
+ * Cancel the statement currently running on `db`, from another thread.
+ *
+ * The execute entry points below (zeta_exec, zeta_step, zeta_txn_exec, ...)
+ * are synchronous: they block the calling thread for the whole statement. An
+ * application that wraps them — e.g. a thread pool running queries behind an
+ * async server — otherwise has no way to stop a runaway query. Call this from
+ * ANY OTHER thread while such a call is in flight and the running statement
+ * aborts at its next cooperative checkpoint (about one scan batch) with a
+ * "canceling statement due to user request" error.
+ *
+ * Cancellation is per-statement and self-clearing: every statement starts with
+ * a fresh token, so calling this while `db` is idle does not affect later work,
+ * and a cancelled handle stays fully usable — just issue the next statement.
+ *
+ * For a time-based bound prefer `SET statement_timeout = <ms>`, which the
+ * engine enforces itself without a caller-managed timer thread.
+ *
+ * Returns ZETA_OK, or ZETA_ERR_UNKNOWN if `db` is NULL.
+ *
+ * Thread safety: this is the one call explicitly designed to run concurrently
+ * with another thread's in-flight call on the same handle. The caller must
+ * still not race it against zeta_close().
+ */
+int zeta_cancel(const zeta_db_t *db);
 
 /* ── One-shot execution ────────────────────────────────────────────────────── */
 
@@ -184,7 +335,7 @@ int zeta_bind_int32(zeta_stmt_t *stmt, int idx, int32_t val);
 /**
  * Bind a SQL boolean to parameter idx (1-based). Any nonzero `val` is true.
  *
- * Use this rather than zeta_bind_int32 for BOOLEAN columns/parameters so the
+ * Use this rather than zeta_bind_int64 for BOOLEAN columns/parameters so the
  * value is stored and read back as a boolean (true/false) rather than 1/0.
  * Returns ZETA_OK or error.
  */
@@ -218,6 +369,22 @@ int zeta_bind_blob(zeta_stmt_t *stmt, int idx, const void *data, int len);
  * Pass count=0 for an empty vector (floats may be NULL). Returns ZETA_OK or error.
  */
 int zeta_bind_vector(zeta_stmt_t *stmt, int idx, const float *floats, int count);
+
+/*
+ * Typed temporal binds. The value reaches the plan as that type, so it works
+ * as an expression operand (date_trunc('day', $1), $1 + INTERVAL '1 day',
+ * SELECT $1), not only where a column type would coerce text. Payloads match
+ * what zeta_column_int64() returns for ZETA_TYPE_TIMESTAMP..ZETA_TYPE_TIME.
+ * Each returns ZETA_OK or error.
+ */
+/** SQL TIMESTAMP: µs since 1970-01-01T00:00:00. */
+int zeta_bind_timestamp(zeta_stmt_t *stmt, int idx, int64_t us);
+/** SQL TIMESTAMPTZ: µs since the Unix epoch, UTC. */
+int zeta_bind_timestamptz(zeta_stmt_t *stmt, int idx, int64_t us);
+/** SQL DATE: days since 1970-01-01. */
+int zeta_bind_date(zeta_stmt_t *stmt, int idx, int32_t days);
+/** SQL TIME: µs since midnight, 0 to 86400000000 (24:00:00) inclusive. */
+int zeta_bind_time(zeta_stmt_t *stmt, int idx, int64_t us);
 
 /** Bind SQL NULL to parameter idx (1-based). Returns ZETA_OK or error. */
 int zeta_bind_null(zeta_stmt_t *stmt, int idx);
@@ -258,9 +425,17 @@ int zeta_column_count(const zeta_stmt_t *stmt);
 const char *zeta_column_name(const zeta_stmt_t *stmt, int col);
 
 /**
- * Type of column `col` (0-based) for the current row.
- * One of: ZETA_TYPE_NULL, ZETA_TYPE_INT, ZETA_TYPE_FLOAT,
- *         ZETA_TYPE_TEXT, ZETA_TYPE_BLOB.
+ * Type of column `col` (0-based) for the current row — one of the
+ * ZETA_TYPE_* codes: NULL, INT, FLOAT, TEXT, BLOB, BOOL, DECIMAL, UUID, JSON,
+ * VECTOR.
+ *
+ * The code can change from row to row within a column (a NULL cell reports
+ * ZETA_TYPE_NULL). Every non-NULL cell is readable with zeta_column_text().
+ * Handle unknown future codes by falling back to zeta_column_text() — a
+ * reader written against codes 0-5 that treats 6-9 as text keeps working.
+ *
+ * sqlite3_column_type() in sqlite3_compat.h is this function, so it too can
+ * return codes beyond SQLite's five.
  */
 int zeta_column_type(const zeta_stmt_t *stmt, int col);
 
@@ -288,6 +463,20 @@ const char *zeta_column_text(const zeta_stmt_t *stmt, int col);
  */
 const void *zeta_column_blob(const zeta_stmt_t *stmt, int col, int *len_out);
 
+/**
+ * Value of column `col` as a UTF-8 string, WITHOUT a terminating NUL.
+ *
+ * Zero-copy for TEXT columns: returns a pointer directly into the engine's
+ * row buffer (no allocation), with `*len_out` set to the byte length. Non-text
+ * values are formatted exactly as zeta_column_text() would render them. The
+ * bytes are valid UTF-8 but are NOT NUL-terminated, so you MUST honor *len_out
+ * (use zeta_column_text() if you need a NUL-terminated C string).
+ *
+ * The returned pointer is valid until the next zeta_step() / zeta_reset().
+ * Returns NULL (and sets *len_out = 0) for NULL values.
+ */
+const char *zeta_column_str(const zeta_stmt_t *stmt, int col, int *len_out);
+
 /* ── Transactions ──────────────────────────────────────────────────────────── */
 
 /**
@@ -295,6 +484,24 @@ const void *zeta_column_blob(const zeta_stmt_t *stmt, int col, int *len_out);
  * Complete with zeta_commit() or zeta_rollback().
  */
 zeta_txn_t *zeta_begin(zeta_db_t *db, char **err_msg);
+
+/** Isolation levels for zeta_begin_isolation(). */
+#define ZETA_ISOLATION_SNAPSHOT     0  /* the default of zeta_begin(); PostgreSQL's REPEATABLE READ */
+#define ZETA_ISOLATION_SERIALIZABLE 1  /* serializable snapshot isolation (SSI) */
+
+/**
+ * Begin a transaction at an explicit isolation level (ZETA_ISOLATION_*).
+ *
+ * zeta_begin() is ZETA_ISOLATION_SNAPSHOT: reads see one consistent snapshot and concurrent writes to
+ * the same row conflict, but two transactions that each read what the other writes can BOTH commit
+ * (write skew). With ZETA_ISOLATION_SERIALIZABLE one of them fails at zeta_commit() with a
+ * serialization failure (ZETA_ERR_CONFLICT) and the caller retries.
+ *
+ * The level is chosen here and cannot be raised later: "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+ * inside a transaction that is not serializable is an error (it used to be accepted and ignored).
+ * An unknown level is an error. Returns NULL on error and sets err_msg like zeta_begin().
+ */
+zeta_txn_t *zeta_begin_isolation(zeta_db_t *db, int isolation, char **err_msg);
 
 /**
  * Execute a SQL statement within a transaction, discarding results.
@@ -334,6 +541,10 @@ int zeta_rollback(zeta_txn_t *txn);
  * Mirrors SQLite's `sqlite3_changes()`. The count is reset to 0 on every
  * `zeta_exec` and on the first `zeta_step` of a new statement. DDL (CREATE,
  * DROP, ALTER) and SELECT also reset the count to 0.
+ *
+ * Statements prepared with `zeta_txn_prepare` update it too, with the count
+ * from inside the transaction. DML with RETURNING counts the rows it returns,
+ * as PostgreSQL does.
  */
 int64_t zeta_changes(const zeta_db_t *db);
 
@@ -387,12 +598,11 @@ int zeta_checkpoint(zeta_db_t *db, char **err_msg);
 /**
  * Create an online backup of the database at `backup_dir`.
  *
- * `backup_dir` must be an absolute path. For LSM-backed databases the backup
- * is crash-consistent (SST files are hard-linked and restore will replay any
- * captured log tail). BTree-backed persistent databases (the default for
- * zeta_open) do not currently produce a complete restorable MVCC snapshot
- * and will return a negative error code — use an LSM-backed database when
- * crash-consistent backups are required.
+ * `backup_dir` must be an absolute path. For Quartz- and LSM-backed databases
+ * the backup is crash-consistent (store files are copied or hard-linked, and
+ * restore replays any captured log tail); open the copy with the same mode.
+ * In-memory databases have no image to copy and return a negative error code
+ * without creating `backup_dir`.
  *
  * Returns ZETA_OK or a negative error code.
  * `err_msg` (if non-NULL) receives a newly-allocated error string on failure.
@@ -437,7 +647,8 @@ int zeta_table_info(zeta_db_t *db, const char *table_name, char **out, char **er
  *          VECTOR(n) column or HNSW index used with embed().
  * `fn_ptr` — callback filling `buf[0..dims]` with the embedding. Return 0
  *            on success, -1 on error (and set *err_msg to a string allocated
- *            with a compatible allocator; zeta takes ownership).
+ *            with malloc/strdup; zeta takes ownership and frees it with the
+ *            C library's free(), whatever allocator zeta itself was built with).
  *
  * Replaces any previously registered provider. The provider is process-global.
  * Returns ZETA_OK or a negative error code.
@@ -514,13 +725,20 @@ int zeta_use_voyage_embed(
  * Workbench, etc.) can connect to, exposing the in-process database
  * for ad-hoc inspection.
  *
- * NOT FOR PRODUCTION USE. The listeners default to:
+ * NOT FOR PRODUCTION USE, AND UNAUTHENTICATED. These listeners perform
+ * NO authentication (trust-all, no password/SCRAM/TLS): anyone who can
+ * reach the port has full read/write/DDL access to the database. Treat an
+ * open port as equivalent to handing out the database. They default to:
  *   - loopback-only bind addresses (rejected unless
- *     ZETA_ALLOW_NONLOCAL_EMBED_LISTEN=1 is set in the environment),
+ *     ZETA_ALLOW_NONLOCAL_EMBED_LISTEN=1 is set in the environment; because
+ *     there is no auth, a non-loopback bind exposes the DB to the network
+ *     and logs a prominent WARN — trusted dev/test networks only),
  *   - trust authentication (no password),
+ *   - capped concurrent connections and (pgwire) a per-statement timeout,
  *   - in-memory replication slots (pgwire).
  *
- * For a real network-accessible Zeta server, run zeta-server-bin.
+ * For a real, authenticated, network-accessible Zeta server, run
+ * zeta-server-bin.
  */
 
 #ifdef ZETA_DEV_LISTENERS
@@ -528,8 +746,10 @@ int zeta_use_voyage_embed(
 /**
  * Start a PostgreSQL wire-protocol listener serving `db`.
  *
- * `addr` is a TCP bind string ("127.0.0.1:5433" by convention).  The
- * listener spawns onto the embedded database's Tokio runtime.
+ * UNAUTHENTICATED: anyone who can reach the port gets full access to the
+ * database (see the section note above). `addr` is a TCP bind string
+ * ("127.0.0.1:5433" by convention).  The listener spawns onto the embedded
+ * database's Tokio runtime.
  *
  * Returns ZETA_OK on success or a negative error code on failure.
  * `err_msg` (if non-NULL) receives a newly-allocated error string on
@@ -540,8 +760,9 @@ int zeta_use_voyage_embed(
 int zeta_start_pgwire(zeta_db_t *db, const char *addr, char **err_msg);
 
 /**
- * Start a MySQL wire-protocol listener serving `db`.  Same loopback
- * restriction and developer-only caveats as zeta_start_pgwire.
+ * Start a MySQL wire-protocol listener serving `db`.  UNAUTHENTICATED,
+ * with the same loopback restriction and developer-only caveats as
+ * zeta_start_pgwire — anyone who can reach the port has full DB access.
  *
  * Requires libzeta built with the `wire-mysql` (or `dev-listeners`) feature.
  */
@@ -560,6 +781,43 @@ int zeta_start_mysqlwire(zeta_db_t *db, const char *addr, char **err_msg);
 int zeta_stop_listeners(zeta_db_t *db);
 
 #endif /* ZETA_DEV_LISTENERS */
+
+/* ── OLAP routing observability ────────────────────────────────────────────── */
+
+/*
+ * Optional: gated on the `olap` Cargo feature in zeta-embedded-c, and on the
+ * matching ZETA_OLAP macro in this header. Define ZETA_OLAP before including
+ * zeta.h to expose the declaration; the symbol is linkable only against a
+ * libzeta built with the `olap` feature. The database must have been opened
+ * with an OLAP-capable backend (zeta_open_mode with ZETA_MODE_LSM / QUARTZ /
+ * MEMORY) for an engine to be present.
+ */
+#ifdef ZETA_OLAP
+/**
+ * Report analytical-routing counters for the in-process columnar engine.
+ *
+ * Each out-param is optional (pass NULL to skip). On success returns ZETA_OK
+ * and fills the non-NULL out-params:
+ *   - queries_routed        — analytical queries served by the columnar engine
+ *   - declined_stale        — declines: columnar tier not yet fresh enough
+ *   - declined_unsupported  — declines: query shape not supported by OLAP
+ *   - declined_error        — declines: an execution error forced row fallback
+ *   - applied_lsn / applied_ts — the applier's watermark (LSN + timestamp)
+ *
+ * Returns ZETA_OLAP_ABSENT if no OLAP engine is running (out-params untouched),
+ * distinct from ZETA_OK with zero counters (engine present, nothing routed yet).
+ * On other failures returns a negative error code and, if `err_msg` is non-NULL,
+ * sets it to a newly-allocated string — free with zeta_free().
+ */
+int zeta_olap_stats(zeta_db_t *db,
+                    uint64_t *queries_routed,
+                    uint64_t *declined_stale,
+                    uint64_t *declined_unsupported,
+                    uint64_t *declined_error,
+                    uint64_t *applied_lsn,
+                    uint64_t *applied_ts,
+                    char **err_msg);
+#endif /* ZETA_OLAP */
 
 /* ── Miscellaneous ─────────────────────────────────────────────────────────── */
 

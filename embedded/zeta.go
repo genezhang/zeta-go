@@ -43,6 +43,41 @@ func Open(path string) (*Database, error) {
 	return &Database{handle: handle}, nil
 }
 
+// Storage backend selector for OpenMode, mirroring ZETA_MODE_* of zeta.h.
+type Mode int
+
+const (
+	// ModeLSM is the LSM-tree backend.
+	ModeLSM Mode = C.ZETA_MODE_LSM
+	// ModeQuartz is the default backend (what Open uses, with the OLTP profile).
+	ModeQuartz Mode = C.ZETA_MODE_QUARTZ
+	// ModeMemory is an in-memory database; the path is ignored.
+	ModeMemory Mode = C.ZETA_MODE_MEMORY
+	// ModeFlagHTAP is OR-ed into a mode to also start the columnar analytics
+	// tier: analytical SQL (aggregates, GROUP BY) then routes to it. Open does
+	// not start it. It only has an effect in an archive built with the olap
+	// feature, which the shipped archives are.
+	ModeFlagHTAP Mode = C.ZETA_MODE_FLAG_HTAP
+)
+
+// OpenMode opens a database with an explicit storage backend, e.g.
+//
+//	embedded.OpenMode(path, embedded.ModeQuartz|embedded.ModeFlagHTAP)
+//
+// The retired BTree backend (code 0) is rejected with an error, and a data
+// directory is opened only by the backend that created it.
+func OpenMode(path string, mode Mode) (*Database, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	var errMsg *C.char
+	handle := C.zeta_open_mode(cpath, C.int(mode), &errMsg)
+	if handle == nil {
+		return nil, consumeErrMsg(errMsg, ErrUnknown)
+	}
+	return &Database{handle: handle}, nil
+}
+
 // OpenMemory opens a new in-memory database. Data is lost when the handle
 // is closed.
 func OpenMemory() (*Database, error) {

@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 	"unsafe"
@@ -152,19 +153,32 @@ func (c *conn) Close() error {
 }
 
 func (c *conn) Begin() (driver.Tx, error) {
-	return c.beginTx()
+	return c.beginTx(IsolationSnapshot)
 }
 
-func (c *conn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+// BeginTx maps database/sql isolation levels onto Zeta's two: LevelSerializable
+// is serializable snapshot isolation (a conflict surfaces from Commit as an
+// *Error of Kind ErrConflict; retry the transaction), and every other
+// supported level runs at snapshot isolation, which is at least as strong as
+// READ COMMITTED and REPEATABLE READ. LevelLinearizable is rejected rather
+// than silently weakened. TxOptions.ReadOnly is not enforced.
+func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// Isolation / read-only options are not plumbed through the C API; Zeta
-	// uses snapshot isolation by default.
-	return c.beginTx()
+	level := IsolationSnapshot
+	switch sql.IsolationLevel(opts.Isolation) {
+	case sql.LevelDefault, sql.LevelReadUncommitted, sql.LevelReadCommitted,
+		sql.LevelWriteCommitted, sql.LevelRepeatableRead, sql.LevelSnapshot:
+	case sql.LevelSerializable:
+		level = IsolationSerializable
+	default:
+		return nil, fmt.Errorf("zeta: isolation level %v is not supported", sql.IsolationLevel(opts.Isolation))
+	}
+	return c.beginTx(level)
 }
 
-func (c *conn) beginTx() (driver.Tx, error) {
+func (c *conn) beginTx(level Isolation) (driver.Tx, error) {
 	if c.handle == nil {
 		return nil, ErrClosed
 	}
@@ -172,7 +186,7 @@ func (c *conn) beginTx() (driver.Tx, error) {
 		return nil, errors.New("zeta: nested transactions are not supported")
 	}
 	var errMsg *C.char
-	h := C.zeta_begin(c.handle, &errMsg)
+	h := C.zeta_begin_isolation(c.handle, C.int(level), &errMsg)
 	if h == nil {
 		return nil, consumeErrMsg(errMsg, errorKindFromCode(int(C.zeta_errcode(c.handle))))
 	}
