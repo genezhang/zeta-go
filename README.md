@@ -200,8 +200,9 @@ false auto-closes) and always defer Close/Rollback.
 `CREATE BRANCH name` forks the database copy-on-write; a session that selects the branch reads
 main as it was when the branch was created plus its own changes, and writes only to the branch.
 `MERGE BRANCH name` publishes the branch's writes to main and consumes it; `DROP BRANCH name`
-discards it. Branch DDL is plain SQL and must run on a handle with no branch selected; *selecting*
-a branch is `SetBranch`, because selection is session state.
+discards it. Branch DDL is plain SQL and must run on a handle with no branch selected (it fails on
+one that has selected a branch); *selecting* a branch is `SetBranch`, because selection is session
+state.
 
 Selection belongs to a session, not to the engine, so two goroutines that share one `*Database`
 share one branch pointer. Give each concurrent caller its own session with `Connect`, and close
@@ -218,9 +219,19 @@ defer a.Close()
 a.SetBranch("agent_a")
 a.Exec("INSERT INTO notes VALUES (1, 'draft')") // lands on agent_a; db still reads main
 
-a.SetBranch("")                // back to main, then publish
-a.Exec("MERGE BRANCH agent_a")
+a.SetBranch("") // back to main, then publish
+rows, _ := a.Query("MERGE BRANCH agent_a")
+conflicts := 0
+for rows.Next() {
+	conflicts++
+}
+rows.Close() // conflicts == 0: merged
 ```
+
+**Read the result of `MERGE BRANCH`.** It reports conflicts as rows (`table_name`, `pk`, `branch_op`,
+`base_change`). No rows means the branch was merged and is gone. Any row means **nothing was merged**:
+the merge is all-or-nothing, the branch is left as it was, and the call still succeeds. `Exec` drops
+rows, so a conflicted merge made through `Exec` looks like success: run it through `Query`.
 
 The branch name is stored, not checked: a branch that does not exist (or was dropped) is reported
 by the next statement, and `SetBranch("")` recovers. A transaction runs on the branch that was
