@@ -104,6 +104,8 @@ embedded.OpenMemory() (*Database, error)
 embedded.OpenMode(path string, mode Mode) (*Database, error)
 
 (*Database).Close() error
+(*Database).Connect() (*Database, error)                          // a new session: its own branch selection
+(*Database).SetBranch(name string) error                          // select a branch; "" returns to main
 (*Database).Exec(sql string, params ...any) (Result, error)
 (*Database).Query(sql string, params ...any) (*Rows, error)
 (*Database).Begin() (*Tx, error)                                  // snapshot isolation
@@ -192,6 +194,49 @@ separate `*Database` handles.
 An open `*Rows` or `*Tx` holds the database mutex until closed /
 committed / rolled back. Iterate `Rows` to completion (Next returning
 false auto-closes) and always defer Close/Rollback.
+
+### Branching
+
+`CREATE BRANCH name` forks the database copy-on-write; a session that selects the branch reads
+main as it was when the branch was created plus its own changes, and writes only to the branch.
+`MERGE BRANCH name` publishes the branch's writes to main and consumes it; `DROP BRANCH name`
+discards it. Branch DDL is plain SQL and must run on a handle with no branch selected; *selecting*
+a branch is `SetBranch`, because selection is session state.
+
+Selection belongs to a session, not to the engine, so two goroutines that share one `*Database`
+share one branch pointer. Give each concurrent caller its own session with `Connect`, and close
+sessions before the `*Database` they came from:
+
+```go
+db, _ := embedded.Open("/var/lib/app/db")
+defer db.Close()
+db.Exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+db.Exec("CREATE BRANCH agent_a")
+
+a, _ := db.Connect() // one session per concurrent caller
+defer a.Close()
+a.SetBranch("agent_a")
+a.Exec("INSERT INTO notes VALUES (1, 'draft')") // lands on agent_a; db still reads main
+
+a.SetBranch("")                // back to main, then publish
+a.Exec("MERGE BRANCH agent_a")
+```
+
+The branch name is stored, not checked: a branch that does not exist (or was dropped) is reported
+by the next statement, and `SetBranch("")` recovers. A transaction runs on the branch that was
+selected when it began, and `SetBranch` waits for an open `*Tx` on the same handle like every
+other method, so select before `Begin`.
+
+With `database/sql`, a connection is its own session. Select the branch through `sql.Conn.Raw`:
+
+```go
+conn, _ := sqlDB.Conn(ctx)
+defer conn.Close()
+conn.Raw(func(dc any) error { return dc.(embedded.BranchSelector).SetBranch("agent_a") })
+```
+
+A connection that goes back to the pool is reset to main, so a selection never reaches the next
+user of a pooled connection.
 
 ### Inspecting an embedded database with psql / mysql (dev only)
 

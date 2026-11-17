@@ -108,15 +108,49 @@ func openConn(dsn string) (*conn, error) {
 // guarantees a driver.Conn is used by a single goroutine at a time, so no
 // internal locking is required here.
 type conn struct {
-	handle *C.zeta_db_t
-	txn    *C.zeta_txn_t // non-nil while a transaction is open
+	handle   *C.zeta_db_t
+	txn      *C.zeta_txn_t // non-nil while a transaction is open
+	branched bool          // a branch is selected (see SetBranch); ResetSession clears it
 }
 
 var (
 	_ driver.Conn               = (*conn)(nil)
 	_ driver.ConnPrepareContext = (*conn)(nil)
 	_ driver.ConnBeginTx        = (*conn)(nil)
+	_ driver.SessionResetter    = (*conn)(nil)
+	_ BranchSelector            = (*conn)(nil)
 )
+
+// SetBranch selects the database branch for this connection ("" returns to
+// main); see [Database.SetBranch]. Use it through sql.Conn.Raw and
+// [BranchSelector].
+func (c *conn) SetBranch(name string) error {
+	if c.handle == nil {
+		return ErrClosed
+	}
+	if err := setBranch(c.handle, name); err != nil {
+		return err
+	}
+	c.branched = name != ""
+	return nil
+}
+
+// ResetSession is called by database/sql before a pooled connection is reused:
+// a branch selected by an earlier user goes back to main, so selection is
+// never inherited through the pool. A connection that cannot be reset is
+// discarded.
+func (c *conn) ResetSession(_ context.Context) error {
+	if c.handle == nil {
+		return driver.ErrBadConn
+	}
+	if c.branched {
+		if err := setBranch(c.handle, ""); err != nil {
+			return driver.ErrBadConn
+		}
+		c.branched = false
+	}
+	return nil
+}
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return c.prepare(query)
