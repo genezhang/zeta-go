@@ -2,8 +2,10 @@ package embedded
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Sessions and branch selection (Database.Connect / SetBranch). The same
@@ -142,8 +144,8 @@ func TestBranchDDLNeedsASessionWithNoBranchSelected(t *testing.T) {
 	if err := s.SetBranch("one"); err != nil {
 		t.Fatalf("SetBranch: %v", err)
 	}
-	if _, err := s.Exec("CREATE BRANCH two"); err == nil || !strings.Contains(err.Error(), "main") {
-		t.Fatalf("CREATE BRANCH on a branch-selected session: err = %v; want one that mentions main", err)
+	if _, err := s.Exec("CREATE BRANCH two"); err == nil || !strings.Contains(err.Error(), "branch DDL must run on main") {
+		t.Fatalf("CREATE BRANCH on a branch-selected session: err = %v; want \"branch DDL must run on main\"", err)
 	}
 	if err := s.SetBranch(""); err != nil {
 		t.Fatalf("clear: %v", err)
@@ -323,6 +325,17 @@ func TestBranchReadsMainAsOfTheFork(t *testing.T) {
 	if got := value(t, s, 2); got != "base2" {
 		t.Fatalf("row 2 on the branch = %q; want base2 (main's later delete is invisible)", got)
 	}
+	rows, err := s.Query("SELECT v FROM kv WHERE id = $1", 3)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("row 3 (inserted on main after the fork) is visible on the branch; want it invisible")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
 }
 
 // MERGE BRANCH returns conflicts as rows; a conflicted merge merges nothing and leaves the branch alone, and a
@@ -385,8 +398,9 @@ func TestMergeReportsConflictsAsRowsAndACleanMergeConsumesTheBranch(t *testing.T
 		err = rows.Err()
 		rows.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "clean") {
-		t.Fatalf("reading a merged branch: err = %v; want one naming the consumed branch", err)
+	var zerr *Error
+	if !errors.As(err, &zerr) || zerr.Kind != ErrNotFound || !strings.Contains(err.Error(), `branch "clean" does not exist`) {
+		t.Fatalf("reading a merged branch: err = %v; want ErrNotFound naming the consumed branch", err)
 	}
 	if err := s.SetBranch(""); err != nil {
 		t.Fatal(err)
@@ -438,5 +452,205 @@ func TestNewSessionStartsOnMainWhateverItsParentSelected(t *testing.T) {
 	}
 	if got := countRows(t, child); got != 2 {
 		t.Fatalf("the child reads %d rows; want 2 (main)", got)
+	}
+}
+
+// The README says an open *Tx does not hold the database lock (it locks per call), a transaction keeps the branch
+// it began on, and only an open *Rows holds the lock. Each of those is pinned here.
+func TestATransactionKeepsItsBranchWhenTheHandleReselectsMidway(t *testing.T) {
+	db := seededBranchDB(t)
+	mustExec(t, db, "CREATE BRANCH keep")
+	s := session(t, db)
+	if err := s.SetBranch("keep"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.SetBranch("") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetBranch with a Tx open: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetBranch blocked while a Tx was open; an open Tx must not hold the database lock between its calls")
+	}
+
+	if _, err := tx.Exec("INSERT INTO t VALUES (500)"); err != nil {
+		t.Fatalf("tx.Exec: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if got := countRows(t, s); got != 2 { // s now reads main
+		t.Fatalf("after the commit the handle (on main) sees %d rows; want 2: the Tx wrote to main", got)
+	}
+	if err := s.SetBranch("keep"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, s); got != 3 {
+		t.Fatalf("the branch the Tx began on has %d rows; want 3", got)
+	}
+}
+
+func TestAnOpenRowsHoldsTheLockThatSetBranchAndConnectNeed(t *testing.T) {
+	db := seededBranchDB(t)
+	rows, err := db.Query("SELECT id FROM t")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close() // idempotent; on a failure below it frees the lock so the cleanup's db.Close cannot deadlock
+
+	setDone := make(chan error, 1)
+	type connected struct {
+		s   *Database
+		err error
+	}
+	connDone := make(chan connected, 1)
+	go func() { setDone <- db.SetBranch("") }()
+	go func() {
+		s, err := db.Connect()
+		connDone <- connected{s, err}
+	}()
+	select {
+	case <-setDone:
+		t.Fatal("SetBranch returned while a Rows was open on the same Database")
+	case <-connDone:
+		t.Fatal("Connect returned while a Rows was open on the same Database")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	rows.Close()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-setDone:
+			if err != nil {
+				t.Fatalf("SetBranch after the Rows closed: %v", err)
+			}
+		case c := <-connDone:
+			if c.err != nil {
+				t.Fatalf("Connect after the Rows closed: %v", c.err)
+			}
+			defer c.s.Close() // before db: t.Cleanup runs after this test function returns
+		case <-time.After(5 * time.Second):
+			t.Fatal("SetBranch / Connect still blocked after the Rows was closed")
+		}
+	}
+}
+
+// Query runs MERGE BRANCH when the rows are first stepped, so closing them without a Next leaves the merge
+// undone and the branch intact. The README tells callers to iterate.
+func TestMergeRunsWhenTheRowsAreFirstSteppedNotWhenQueryReturns(t *testing.T) {
+	db := seededBranchDB(t)
+	mustExec(t, db, "CREATE BRANCH lazy")
+	s := session(t, db)
+	if err := s.SetBranch("lazy"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s, "INSERT INTO t VALUES (9)")
+	if err := s.SetBranch(""); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Query("MERGE BRANCH lazy")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := countRows(t, db); got != 2 {
+		t.Fatalf("main has %d rows after Query+Close without Next; want 2 (the merge has not run)", got)
+	}
+
+	if n := mergeBranch(t, s, "lazy"); n != 0 { // iterating runs it
+		t.Fatalf("MERGE BRANCH reported %d conflicts; want 0", n)
+	}
+	if got := countRows(t, db); got != 3 {
+		t.Fatalf("main has %d rows after iterating the merge; want 3", got)
+	}
+}
+
+// The columns the README documents for a conflict row, and that Exec reports a conflicted merge as success.
+func TestMergeConflictRowsCarryTheDocumentedColumnsAndExecHidesThem(t *testing.T) {
+	db := seededKV(t)
+	mustExec(t, db, "CREATE BRANCH clash")
+	mustExec(t, db, "UPDATE kv SET v = $1 WHERE id = $2", "main", 1)
+	s := session(t, db)
+	if err := s.SetBranch("clash"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s, "UPDATE kv SET v = $1 WHERE id = $2", "branch", 1)
+	if err := s.SetBranch(""); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Query("MERGE BRANCH clash")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !rows.Next() {
+		rows.Close()
+		t.Fatalf("no conflict row; err = %v", rows.Err())
+	}
+	var table, pk, op, base string
+	if err := rows.Scan(&table, &pk, &op, &base); err != nil {
+		rows.Close()
+		t.Fatalf("Scan(4 columns): %v", err)
+	}
+	cols := rows.Columns()
+	rows.Close()
+	if strings.Join(cols, ",") != "table_name,pk,branch_op,base_change" {
+		t.Fatalf("conflict columns = %v; want table_name, pk, branch_op, base_change", cols)
+	}
+	if table != "public.kv" || pk != "1" || op == "" || base == "" {
+		t.Fatalf("conflict row = %q %q %q %q; want public.kv, 1, then a branch_op and a base_change", table, pk, op, base)
+	}
+
+	// Exec drops the rows: the same conflicted merge "succeeds" and merges nothing.
+	if _, err := s.Exec("MERGE BRANCH clash"); err != nil {
+		t.Fatalf("Exec of a conflicted MERGE BRANCH: %v; the README says it succeeds", err)
+	}
+	if got := value(t, db, 1); got != "main" {
+		t.Fatalf("main row 1 = %q; want main (nothing merged)", got)
+	}
+	if n := mergeBranch(t, s, "clash"); n != 1 {
+		t.Fatalf("the branch should still conflict after the Exec: %d conflict rows; want 1", n)
+	}
+}
+
+// A name with a NUL would reach the engine as a C string cut at the NUL, selecting a different branch.
+func TestABranchNameWithANulByteIsRefusedAndKeepsTheSelection(t *testing.T) {
+	db := seededBranchDB(t)
+	mustExec(t, db, "CREATE BRANCH good")
+	s := session(t, db)
+	if err := s.SetBranch("good"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s, "INSERT INTO t VALUES (77)")
+
+	for _, name := range []string{"good\x00junk", "\x00", "\x00good"} {
+		if err := s.SetBranch(name); err == nil || !strings.Contains(err.Error(), "NUL") {
+			t.Fatalf("SetBranch(%q) = %v; want an error about the NUL byte", name, err)
+		}
+	}
+	if got := countRows(t, s); got != 3 {
+		t.Fatalf("after the refused names the session sees %d rows; want 3 (still on good)", got)
+	}
+
+	// The database/sql connection takes the same path.
+	sdb := openSQLDB(t)
+	conn, err := sdb.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("Conn: %v", err)
+	}
+	defer conn.Close()
+	err = conn.Raw(func(dc any) error { return dc.(BranchSelector).SetBranch("a\x00b") })
+	if err == nil || !strings.Contains(err.Error(), "NUL") {
+		t.Fatalf("driver SetBranch with a NUL = %v; want an error about the NUL byte", err)
 	}
 }

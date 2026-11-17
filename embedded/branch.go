@@ -6,7 +6,10 @@ package embedded
 */
 import "C"
 
-import "unsafe"
+import (
+	"strings"
+	"unsafe"
+)
 
 // Connect opens a new session (connection) over the same engine as d.
 //
@@ -25,6 +28,9 @@ import "unsafe"
 //
 // Close each session with Close. Close sessions before the Database they were
 // opened from: the C API requires the original handle to be closed last.
+//
+// Connect takes d's lock, so it waits for an open *Rows on d to be closed
+// (called from the goroutine that holds that Rows, it never returns).
 func (d *Database) Connect() (*Database, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -46,11 +52,14 @@ func (d *Database) Connect() (*Database, error) {
 // none selected ("MERGE BRANCH name" publishes a branch to main and consumes
 // it; "DROP BRANCH name" discards it). The selection is sticky on d and applies
 // to its statements, prepared statements and transactions. A transaction runs
-// on the branch that was selected when it began; like every other Database
-// method, SetBranch waits for an open Tx on d to finish, so select the branch
-// before Begin. The name is not checked here: a branch that does not exist, or
-// that was dropped later, is reported by the next statement, and
-// SetBranch("") recovers.
+// on the branch that was selected when it began, and keeps it: a SetBranch
+// made while a Tx is open takes effect for d's later statements, not for that
+// Tx. Select the branch before Begin all the same. SetBranch takes d's lock, so
+// it waits for an open *Rows on d to be closed. The name is not checked here: a
+// branch that does not exist, or that was dropped later, is reported by the
+// next statement, and SetBranch("") recovers. A name that contains a NUL byte
+// is refused, because the engine would read it as ending at the NUL and select
+// a different branch.
 func (d *Database) SetBranch(name string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -63,6 +72,9 @@ func (d *Database) SetBranch(name string) error {
 // setBranch wraps zeta_set_branch. The empty name goes to the engine as the
 // empty string, which it treats as main.
 func setBranch(h *C.zeta_db_t, name string) error {
+	if strings.IndexByte(name, 0) >= 0 {
+		return &Error{Kind: ErrUnknown, Message: "branch name contains a NUL byte"}
+	}
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
 

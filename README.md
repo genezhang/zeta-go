@@ -191,9 +191,13 @@ if errors.As(err, &ze) && ze.Kind == embedded.ErrConflict {
 operations serialise through an internal mutex; for parallelism, open
 separate `*Database` handles.
 
-An open `*Rows` or `*Tx` holds the database mutex until closed /
-committed / rolled back. Iterate `Rows` to completion (Next returning
-false auto-closes) and always defer Close/Rollback.
+An open `*Rows` holds the database mutex until it is closed: every other
+call on the same `*Database` (including `Connect` and `SetBranch`) waits for
+it, and from the goroutine that holds the `Rows` it never returns. Iterate
+`Rows` to completion (Next returning false auto-closes) and always defer
+Close. A `*Tx` locks the database only for the duration of each of its calls,
+so other calls on the same `*Database` are not held up between them; always
+defer Rollback.
 
 ### Branching
 
@@ -231,14 +235,18 @@ rows.Close() // conflicts == 0: merged
 **Read the result of `MERGE BRANCH`.** It reports conflicts as rows (`table_name`, `pk`, `branch_op`,
 `base_change`). No rows means the branch was merged and is gone. Any row means **nothing was merged**:
 the merge is all-or-nothing, the branch is left as it was, and the call still succeeds. `Exec` drops
-rows, so a conflicted merge made through `Exec` looks like success: run it through `Query`.
+rows, so a conflicted merge made through `Exec` looks like success: run it through `Query`. `Query`
+runs the statement when you first step the rows, so always iterate before you close them: closing the
+`*Rows` without calling `Next` leaves the merge undone, with no error.
 
 The branch name is stored, not checked: a branch that does not exist (or was dropped) is reported
-by the next statement, and `SetBranch("")` recovers. A transaction runs on the branch that was
-selected when it began, and `SetBranch` waits for an open `*Tx` on the same handle like every
-other method, so select before `Begin`.
+by the next statement, and `SetBranch("")` recovers. A name containing a NUL byte is refused. A
+transaction runs on the branch that was selected when it began and keeps it, even if `SetBranch`
+is called on the same handle while the `*Tx` is open (the new selection applies to the handle's
+later statements); select before `Begin`.
 
-With `database/sql`, a connection is its own session. Select the branch through `sql.Conn.Raw`:
+With `database/sql`, each connection holds its own branch selection. Select the branch through
+`sql.Conn.Raw`:
 
 ```go
 conn, _ := sqlDB.Conn(ctx)
@@ -249,11 +257,15 @@ conn.Raw(func(dc any) error { return dc.(embedded.BranchSelector).SetBranch("age
 A connection that goes back to the pool is reset to main, so a selection never reaches the next
 user of a pooled connection.
 
-### Inspecting an embedded database with psql / mysql (dev only)
+A pooled connection is its own engine handle (`zeta_open`), not a `Connect` session over one
+engine. To give several callers their own branch over one engine, use `Database.Connect` as above.
+
+### Inspecting an embedded database with psql (dev only)
 
 An in-process Zeta database can optionally expose itself on a loopback
-port so a developer can attach `psql`, `mysql`, DBeaver, MySQL
-Workbench, or any other standard client for inspection / debugging.
+port so a developer can attach `psql`, DBeaver, or any other PostgreSQL
+client for inspection / debugging. (The engine's MySQL listener was removed
+for the first public release, so there is no `StartMysqlwireDev`.)
 The facility is gated on a build tag because it is **not for
 production**:
 
@@ -272,17 +284,13 @@ defer db.Close()
 if err := db.StartPgwireDev("127.0.0.1:5433"); err != nil {
     log.Fatal(err)
 }
-if err := db.StartMysqlwireDev("127.0.0.1:3307"); err != nil {
-    log.Fatal(err)
-}
 
 // ... run application logic in-process ...
 // Connect from another terminal:
 //   psql  -h 127.0.0.1 -p 5433 -U zeta
-//   mysql -h 127.0.0.1 -P 3307 -u zeta
 ```
 
-`db.Close()` drains both listeners; explicit `db.StopDevListeners()`
+`db.Close()` drains the listener; explicit `db.StopDevListeners()`
 takes them down without closing the database.
 
 **Caveats**:
@@ -290,12 +298,11 @@ takes them down without closing the database.
   in the environment to bypass the check (developer use only).
 - Trust authentication. SCRAM/TLS support is deferred.
 - Replication slots are kept in memory only.
-- Requires `libzeta.a` built with the `wire-pg` / `wire-mysql` /
-  `dev-listeners` Cargo features. The default `zeta-setup install`
+- Requires `libzeta.a` built with the `wire-pg` Cargo feature. The default `zeta-setup install`
   artifact today is *not* built with these features; rebuild from
   source or wait for a release that bundles them. Building with
   `-tags zeta_dev` against a stock `libzeta.a` produces a linker
-  error pointing at `zeta_start_pgwire` / `zeta_start_mysqlwire`.
+  error pointing at `zeta_start_pgwire`.
 
 ## Single-node or distributed server: use pgx or go-sql-driver/mysql
 
