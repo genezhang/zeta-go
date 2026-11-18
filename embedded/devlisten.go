@@ -2,16 +2,15 @@
 
 // Embedded wire-protocol listeners — developer inspection facility.
 //
-// When compiled with `-tags zeta_dev` this file binds three Go entry
-// points for starting / stopping pgwire and mysqlwire listeners that
-// expose an in-process Zeta database to standard `psql` / `mysql`
-// clients on a loopback port.
+// When compiled with `-tags zeta_dev` this file binds Go entry points
+// for starting / stopping a pgwire listener that exposes an in-process
+// Zeta database to a standard `psql` client on a loopback port. (The
+// engine's MySQL listener was removed for the first public release, so
+// there is no StartMysqlwireDev.)
 //
-// Requires `libzeta.a` to have been built with the `wire-pg` and/or
-// `wire-mysql` Cargo features (or the convenience `dev-listeners`
-// feature that enables both). A stock `libzeta.a` built without
-// those features will fail to link with "undefined reference to
-// zeta_start_pgwire" — see the README.
+// Requires a `libzeta.a` built with the `wire-pg` Cargo feature. A
+// `libzeta.a` built without it will fail to link with "undefined
+// reference to zeta_start_pgwire" — see the README.
 //
 // **Not for production.** The listeners default to:
 //   - loopback-only bind addresses (overridden by setting
@@ -66,25 +65,6 @@ func (d *Database) StartPgwireDev(addr string) error {
 	defer C.free(unsafe.Pointer(caddr))
 	var errMsg *C.char
 	rc := C.zeta_start_pgwire(d.handle, caddr, &errMsg)
-	if rc != C.ZETA_OK {
-		return consumeErrMsg(errMsg, errorKindFromCode(int(rc)))
-	}
-	return nil
-}
-
-// StartMysqlwireDev starts a MySQL wire-protocol listener bound to
-// `addr` (e.g. "127.0.0.1:3307"). Same loopback restriction and
-// developer-only caveats as StartPgwireDev.
-func (d *Database) StartMysqlwireDev(addr string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.handle == nil {
-		return ErrClosed
-	}
-	caddr := C.CString(addr)
-	defer C.free(unsafe.Pointer(caddr))
-	var errMsg *C.char
-	rc := C.zeta_start_mysqlwire(d.handle, caddr, &errMsg)
 	if rc != C.ZETA_OK {
 		return consumeErrMsg(errMsg, errorKindFromCode(int(rc)))
 	}

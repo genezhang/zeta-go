@@ -104,6 +104,8 @@ embedded.OpenMemory() (*Database, error)
 embedded.OpenMode(path string, mode Mode) (*Database, error)
 
 (*Database).Close() error
+(*Database).Connect() (*Database, error)                          // a new session: its own branch selection
+(*Database).SetBranch(name string) error                          // select a branch; "" returns to main
 (*Database).Exec(sql string, params ...any) (Result, error)
 (*Database).Query(sql string, params ...any) (*Rows, error)
 (*Database).Begin() (*Tx, error)                                  // snapshot isolation
@@ -189,15 +191,81 @@ if errors.As(err, &ze) && ze.Kind == embedded.ErrConflict {
 operations serialise through an internal mutex; for parallelism, open
 separate `*Database` handles.
 
-An open `*Rows` or `*Tx` holds the database mutex until closed /
-committed / rolled back. Iterate `Rows` to completion (Next returning
-false auto-closes) and always defer Close/Rollback.
+An open `*Rows` holds the database mutex until it is closed: every other
+call on the same `*Database` (including `Connect` and `SetBranch`) waits for
+it, and from the goroutine that holds the `Rows` it never returns. Iterate
+`Rows` to completion (Next returning false auto-closes) and always defer
+Close. A `*Tx` locks the database only for the duration of each of its calls,
+so other calls on the same `*Database` are not held up between them; always
+defer Rollback.
 
-### Inspecting an embedded database with psql / mysql (dev only)
+### Branching
+
+`CREATE BRANCH name` forks the database copy-on-write; a session that selects the branch reads
+main as it was when the branch was created plus its own changes, and writes only to the branch.
+`MERGE BRANCH name` publishes the branch's writes to main and consumes it; `DROP BRANCH name`
+discards it. Branch DDL is plain SQL and must run on a handle with no branch selected (it fails on
+one that has selected a branch); *selecting* a branch is `SetBranch`, because selection is session
+state.
+
+Selection belongs to a session, not to the engine, so two goroutines that share one `*Database`
+share one branch pointer. Give each concurrent caller its own session with `Connect`, and close
+sessions before the `*Database` they came from:
+
+```go
+db, _ := embedded.Open("/var/lib/app/db")
+defer db.Close()
+db.Exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+db.Exec("CREATE BRANCH agent_a")
+
+a, _ := db.Connect() // one session per concurrent caller
+defer a.Close()
+a.SetBranch("agent_a")
+a.Exec("INSERT INTO notes VALUES (1, 'draft')") // lands on agent_a; db still reads main
+
+a.SetBranch("") // back to main, then publish
+rows, _ := a.Query("MERGE BRANCH agent_a")
+conflicts := 0
+for rows.Next() {
+	conflicts++
+}
+rows.Close() // conflicts == 0: merged
+```
+
+**Read the result of `MERGE BRANCH`.** It reports conflicts as rows (`table_name`, `pk`, `branch_op`,
+`base_change`). No rows means the branch was merged and is gone. Any row means **nothing was merged**:
+the merge is all-or-nothing, the branch is left as it was, and the call still succeeds. `Exec` drops
+rows, so a conflicted merge made through `Exec` looks like success: run it through `Query`. `Query`
+runs the statement when you first step the rows, so always iterate before you close them: closing the
+`*Rows` without calling `Next` leaves the merge undone, with no error.
+
+The branch name is stored, not checked: a branch that does not exist (or was dropped) is reported
+by the next statement, and `SetBranch("")` recovers. A name containing a NUL byte is refused. A
+transaction runs on the branch that was selected when it began and keeps it, even if `SetBranch`
+is called on the same handle while the `*Tx` is open (the new selection applies to the handle's
+later statements); select before `Begin`.
+
+With `database/sql`, each connection holds its own branch selection. Select the branch through
+`sql.Conn.Raw`:
+
+```go
+conn, _ := sqlDB.Conn(ctx)
+defer conn.Close()
+conn.Raw(func(dc any) error { return dc.(embedded.BranchSelector).SetBranch("agent_a") })
+```
+
+A connection that goes back to the pool is reset to main, so a selection never reaches the next
+user of a pooled connection.
+
+A pooled connection is its own engine handle (`zeta_open`), not a `Connect` session over one
+engine. To give several callers their own branch over one engine, use `Database.Connect` as above.
+
+### Inspecting an embedded database with psql (dev only)
 
 An in-process Zeta database can optionally expose itself on a loopback
-port so a developer can attach `psql`, `mysql`, DBeaver, MySQL
-Workbench, or any other standard client for inspection / debugging.
+port so a developer can attach `psql`, DBeaver, or any other PostgreSQL
+client for inspection / debugging. (The engine's MySQL listener was removed
+for the first public release, so there is no `StartMysqlwireDev`.)
 The facility is gated on a build tag because it is **not for
 production**:
 
@@ -216,17 +284,13 @@ defer db.Close()
 if err := db.StartPgwireDev("127.0.0.1:5433"); err != nil {
     log.Fatal(err)
 }
-if err := db.StartMysqlwireDev("127.0.0.1:3307"); err != nil {
-    log.Fatal(err)
-}
 
 // ... run application logic in-process ...
 // Connect from another terminal:
 //   psql  -h 127.0.0.1 -p 5433 -U zeta
-//   mysql -h 127.0.0.1 -P 3307 -u zeta
 ```
 
-`db.Close()` drains both listeners; explicit `db.StopDevListeners()`
+`db.Close()` drains the listener; explicit `db.StopDevListeners()`
 takes them down without closing the database.
 
 **Caveats**:
@@ -234,12 +298,11 @@ takes them down without closing the database.
   in the environment to bypass the check (developer use only).
 - Trust authentication. SCRAM/TLS support is deferred.
 - Replication slots are kept in memory only.
-- Requires `libzeta.a` built with the `wire-pg` / `wire-mysql` /
-  `dev-listeners` Cargo features. The default `zeta-setup install`
+- Requires `libzeta.a` built with the `wire-pg` Cargo feature. The default `zeta-setup install`
   artifact today is *not* built with these features; rebuild from
   source or wait for a release that bundles them. Building with
   `-tags zeta_dev` against a stock `libzeta.a` produces a linker
-  error pointing at `zeta_start_pgwire` / `zeta_start_mysqlwire`.
+  error pointing at `zeta_start_pgwire`.
 
 ## Single-node or distributed server: use pgx or go-sql-driver/mysql
 
