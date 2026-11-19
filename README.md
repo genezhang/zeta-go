@@ -214,14 +214,21 @@ is the same thing in the native API). So:
   runs one statement at a time. There is no need for `SetMaxOpenConns(1)`.
 - Writes to the **same row** from different connections at once conflict, as
   they do between two transactions, even in autocommit: the loser gets an
-  `*Error` with `Kind == ErrConflict` and nothing is lost. Retry it, or
-  serialise the writers with `SetMaxOpenConns(1)`.
-- Temporary tables belong to the engine, not to a session: one connection's
-  `CREATE TEMP TABLE` is visible to the others until `db.Close()`.
+  `*Error` with `Kind == ErrConflict` and nothing is lost. So can a write to a
+  table while another connection runs DDL on it (`CREATE INDEX`, `DROP INDEX`).
+  Retry it, or serialise the writers with `SetMaxOpenConns(1)`. Writes to
+  different rows of one table do not conflict.
+- Some state belongs to the engine, not to a session: one connection's
+  `CREATE TEMP TABLE` is visible to the others until `db.Close()`, and
+  `currval()` / `lastval()` return the last value *any* connection took from the
+  sequence. Use `INSERT ... RETURNING` to read back what you inserted.
 - `":memory:"` is one database per `sql.DB`, shared by all of its connections,
   and it lives until `db.Close()`: it survives the pool closing idle
   connections. Two `sql.Open` calls are two databases.
 - `db.Close()` closes the engine once the last connection over it is closed.
+  The engine belongs to the `sql.DB`, so a persistent path stays open (and
+  locked, where the archive takes a data-directory lock) until then, even while
+  the pool has no open connections.
 - Do not open two `sql.DB` values, or a `sql.DB` and a `*Database`, on the same
   persistent path in one process: that is two engines on one directory. An
   archive that takes the data-directory lock refuses the second open with an

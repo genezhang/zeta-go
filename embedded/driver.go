@@ -37,23 +37,30 @@ func init() {
 // connection), and every connection in its pool is a session over it (the
 // embedded counterpart of DuckDB's connections over one database). A session
 // has its own branch selection, transaction, error and changes state; the
-// storage is shared, and so are temporary tables, which belong to the engine
-// and not to a session: one connection's CREATE TEMP TABLE is visible to the
-// others until db.Close. So:
+// storage is shared, and so is whatever the engine keeps outside a session:
+// temporary tables are visible to every connection until db.Close, and
+// currval() and lastval() return the last value any connection took from the
+// sequence, not this connection's (use INSERT ... RETURNING to read back what
+// you inserted). So:
 //
 //   - A pool of any size is safe over a persistent path: every connection
 //     sees the others' committed writes, and there is one engine on the
 //     directory. SetMaxOpenConns(1) is not needed for that.
 //   - Writes to the same row from different connections at once conflict, as
 //     they do between two transactions, even in autocommit: the loser gets an
-//     *Error of Kind ErrConflict and nothing is lost. Retry it, or serialise
-//     the writers with SetMaxOpenConns(1).
+//     *Error of Kind ErrConflict and nothing is lost. So can a write to a
+//     table while another connection runs DDL on it (CREATE INDEX, DROP
+//     INDEX). Retry it, or serialise the writers with SetMaxOpenConns(1).
+//     Writes to different rows of one table do not conflict.
 //   - ":memory:" is one database per sql.DB, shared by all its connections.
 //     It lives until db.Close, so it survives the pool closing every idle
 //     connection (SetMaxIdleConns, SetConnMaxIdleTime, SetConnMaxLifetime).
 //     Two sql.Open calls are two databases.
 //   - db.Close closes the engine once the last connection over it has closed
 //     (a connection still checked out keeps it open until it is released).
+//     The engine belongs to the sql.DB, so a persistent path stays open, and
+//     locked where the archive takes a data directory lock, until db.Close
+//     even when the pool has no open connections.
 //   - Do not open two sql.DB values, or a sql.DB and a [Database], on the same
 //     persistent path in one process: that is two engines on one directory,
 //     which the engine says corrupts it. An archive that takes the data
@@ -110,7 +117,10 @@ func (Driver) Open(dsn string) (driver.Conn, error) {
 
 // OpenConnector returns a connector for dsn. Its connections are sessions over
 // one engine, opened by the first Connect and closed by the connector's Close
-// (database/sql calls it from DB.Close) after the last connection.
+// after the last connection. sql.OpenDB(connector) closes it from DB.Close; a
+// caller that uses the connector directly must close it itself (it is an
+// io.Closer), or the engine, and the data directory lock where the archive
+// takes one, stays held until the process exits.
 func (Driver) OpenConnector(dsn string) (driver.Connector, error) {
 	return &connector{eng: &engine{dsn: dsn}}, nil
 }
@@ -194,6 +204,7 @@ func (c *conn) Close() error {
 	if c.handle != nil {
 		C.zeta_close(c.handle)
 		c.handle = nil
+		liveSessions.Add(-1)
 		c.eng.sessionClosed() // after the session: the engine closes last
 	}
 	return nil

@@ -29,6 +29,19 @@ func openPool(t *testing.T, dsn string, maxOpen int) *sql.DB {
 	return db
 }
 
+// expectNoLeaks fails the test if it leaves an engine or a session handle open. It is registered first, so it runs
+// last, after the pools the test opened have been closed. (The counters are process-wide: a goroutine that outlives
+// its test and closes a connection later skews every test that reads them, so tests join what they start.)
+func expectNoLeaks(t *testing.T) {
+	t.Helper()
+	e0, s0 := liveEngines.Load(), liveSessions.Load()
+	t.Cleanup(func() {
+		if e, n := liveEngines.Load()-e0, liveSessions.Load()-s0; e != 0 || n != 0 {
+			t.Errorf("the test left %d engines and %d sessions open", e, n)
+		}
+	})
+}
+
 // heldConns takes n connections at the same time. database/sql can only give out a second connection while the
 // first is still held, so these are n distinct driver connections.
 func heldConns(t *testing.T, db *sql.DB, n int) []*sql.Conn {
@@ -66,6 +79,7 @@ func connCount(t *testing.T, c *sql.Conn, table string) int {
 // both directions. The older archive failed the second half silently (c1 stayed at 1); the newer one failed the
 // second connection's open.
 func TestPooledConnectionsOverAPersistentPathShareOneEngine(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, t.TempDir(), 2)
 	cs := heldConns(t, db, 2)
 
@@ -83,6 +97,7 @@ func TestPooledConnectionsOverAPersistentPathShareOneEngine(t *testing.T) {
 // ":memory:" was a separate empty database per connection, which is why the driver doc said to pin the pool to
 // one connection. One engine per sql.DB makes it one database.
 func TestPooledMemoryConnectionsShareOneDatabase(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, ":memory:", 3)
 	cs := heldConns(t, db, 3)
 
@@ -99,6 +114,7 @@ func TestPooledMemoryConnectionsShareOneDatabase(t *testing.T) {
 // The engine belongs to the sql.DB, not to its connections: a pool that closes every connection when it goes
 // idle (SetMaxIdleConns(0)) must not lose an in-memory database between statements.
 func TestAnInMemoryDatabaseOutlivesTheConnectionsOfAnIdlePool(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, ":memory:", 4)
 	db.SetMaxIdleConns(0)
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -114,6 +130,7 @@ func TestAnInMemoryDatabaseOutlivesTheConnectionsOfAnIdlePool(t *testing.T) {
 
 // Two databases are two engines: sharing is per sql.DB, not per DSN string.
 func TestTwoPoolsOnMemoryAreTwoDatabases(t *testing.T) {
+	expectNoLeaks(t)
 	a := openPool(t, ":memory:", 2)
 	b := openPool(t, ":memory:", 2)
 	sqlExec(t, a, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -125,14 +142,17 @@ func TestTwoPoolsOnMemoryAreTwoDatabases(t *testing.T) {
 
 // Committed writes from many connections at once all land, and a reader running alongside never sees a torn count.
 func TestConcurrentWritersOnPooledConnectionsAllLand(t *testing.T) {
+	expectNoLeaks(t)
 	const writers, each = 8, 40
-	db := openPool(t, t.TempDir(), writers)
+	db := openPool(t, t.TempDir(), writers+1) // one connection per writer, and one for the reader
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, w INTEGER)")
 
 	var wg sync.WaitGroup
 	errs := make(chan error, writers+1)
 	stop := make(chan struct{})
-	go func() { // a reader on yet another pooled connection, while the writers run
+	readerDone := make(chan struct{})
+	go func() { // a reader on its own pooled connection, while the writers run
+		defer close(readerDone)
 		for {
 			select {
 			case <-stop:
@@ -164,6 +184,7 @@ func TestConcurrentWritersOnPooledConnectionsAllLand(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
+	<-readerDone // joined: its connection must be back in the pool before the test ends
 	select {
 	case err := <-errs:
 		t.Fatal(err)
@@ -177,6 +198,7 @@ func TestConcurrentWritersOnPooledConnectionsAllLand(t *testing.T) {
 
 // Each connection has its own transaction: uncommitted work on one is invisible to the other, and both commit.
 func TestTransactionsOnDifferentPooledConnectionsAreIndependent(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, ":memory:", 2)
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 
@@ -212,6 +234,7 @@ func TestTransactionsOnDifferentPooledConnectionsAreIndependent(t *testing.T) {
 // BranchSelector means what it says per connection now: sessions over one engine, so a branch created through
 // the pool exists for every connection, and a selection stays on the connection that made it.
 func TestBranchesAreSharedAcrossPooledConnectionsAndSelectionIsPerConnection(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, ":memory:", 2)
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	sqlExec(t, db, "INSERT INTO t VALUES (1)")
@@ -237,6 +260,7 @@ func TestBranchesAreSharedAcrossPooledConnectionsAndSelectionIsPerConnection(t *
 // one is opened and, above all, that it is closed once and only after the last session over it.
 
 func TestAnEngineIsOpenedByTheFirstConnectionAndClosedWithTheDB(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	db, err := sql.Open(DriverName, ":memory:")
 	if err != nil {
@@ -266,6 +290,7 @@ func TestAnEngineIsOpenedByTheFirstConnectionAndClosedWithTheDB(t *testing.T) {
 
 // DB.Close does not wait for a checked-out connection. The engine must stay open under it, and close with it.
 func TestACheckedOutConnectionKeepsTheEngineOpenPastDBClose(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	db, err := sql.Open(DriverName, ":memory:")
 	if err != nil {
@@ -296,6 +321,7 @@ func TestACheckedOutConnectionKeepsTheEngineOpenPastDBClose(t *testing.T) {
 
 // Driver.Open (not through sql.Open) gives a connection a private engine that closes with it.
 func TestDriverOpenGivesAPrivateEngineThatClosesWithTheConnection(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	a, err := Driver{}.Open(":memory:")
 	if err != nil {
@@ -324,6 +350,7 @@ func TestDriverOpenGivesAPrivateEngineThatClosesWithTheConnection(t *testing.T) 
 
 // The connector is a driver.Connector and an io.Closer; closing it twice is harmless, and nothing connects after.
 func TestAConnectorClosedTwiceIsHarmlessAndRefusesNewConnections(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	ci, err := Driver{}.OpenConnector(":memory:")
 	if err != nil {
@@ -359,6 +386,7 @@ func TestAConnectorClosedTwiceIsHarmlessAndRefusesNewConnections(t *testing.T) {
 
 // A failed open holds nothing, and the pool tries again on the next connection rather than caching the failure.
 func TestAFailedOpenHoldsNoEngineAndIsRetried(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	path := t.TempDir() + "/data"
 	if err := os.WriteFile(path, []byte("a regular file where the data directory should be"), 0o600); err != nil {
@@ -385,6 +413,7 @@ func TestAFailedOpenHoldsNoEngineAndIsRetried(t *testing.T) {
 // A persistent pool is reopened after db.Close: the first release really closed the engine (an archive that takes
 // the directory lock refuses this otherwise), and what two connections wrote is all there.
 func TestAPersistentPoolReopensWithWhatItsConnectionsWrote(t *testing.T) {
+	expectNoLeaks(t)
 	dir := t.TempDir()
 	first, err := sql.Open(DriverName, dir)
 	if err != nil {
@@ -411,6 +440,7 @@ func TestAPersistentPoolReopensWithWhatItsConnectionsWrote(t *testing.T) {
 
 // A connection request whose context is already done opens nothing.
 func TestConnectOnACancelledContextOpensNoEngine(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	ci, err := Driver{}.OpenConnector(":memory:")
 	if err != nil {
@@ -429,6 +459,7 @@ func TestConnectOnACancelledContextOpensNoEngine(t *testing.T) {
 
 // The first connections of a pool race to open the engine; exactly one may be opened.
 func TestConcurrentFirstConnectionsOpenOneEngine(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	ci, err := Driver{}.OpenConnector(":memory:")
 	if err != nil {
@@ -474,9 +505,10 @@ func TestConcurrentFirstConnectionsOpenOneEngine(t *testing.T) {
 	}
 }
 
-// database/sql can close a driver connection twice (through sql.Conn.Raw and then normally); the engine must not be
-// told twice that a session went away, or it closes under the sessions that remain.
+// A caller can close a driver connection twice (a Raw callback that closes it, then the sql.Conn's own Close); the
+// engine must not be told twice that a session went away, or it closes under the sessions that remain.
 func TestClosingADriverConnectionTwiceDoesNotCountItOutTwice(t *testing.T) {
+	expectNoLeaks(t)
 	base := liveEngines.Load()
 	db := openPool(t, ":memory:", 2)
 	cs := heldConns(t, db, 2)
@@ -501,11 +533,11 @@ func TestClosingADriverConnectionTwiceDoesNotCountItOutTwice(t *testing.T) {
 	}
 }
 
-// Two connections writing the same row at once is a write-write conflict, as it is between two transactions, and
-// it shows even in autocommit: the loser gets an *Error of Kind ErrConflict, nothing hangs, and nothing that was
-// reported committed is lost. (Several connections over one engine made this reachable; the pool used to hide it
-// by being several separate engines.)
+// Hammering one row from several connections: every failure is an *Error of Kind ErrConflict, nothing hangs, and
+// nothing that was reported committed is lost. (It does not require that a conflict happens: on a single CPU a
+// writer can run its whole loop alone. The next test is the deterministic one.)
 func TestConcurrentWritesToOneRowConflictCleanlyAndLoseNothing(t *testing.T) {
+	expectNoLeaks(t)
 	const writers, each = 4, 60
 	db := openPool(t, ":memory:", writers)
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -555,6 +587,7 @@ func TestConcurrentWritesToOneRowConflictCleanlyAndLoseNothing(t *testing.T) {
 // Temporary tables belong to the engine, not to a session: one connection's is visible to the others, and a
 // second CREATE of the same name fails. The driver doc says so; this keeps it true.
 func TestTemporaryTablesAreEngineWideNotPerConnection(t *testing.T) {
+	expectNoLeaks(t)
 	db := openPool(t, ":memory:", 2)
 	cs := heldConns(t, db, 2)
 	connExec(t, cs[0], "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY)")
@@ -564,5 +597,125 @@ func TestTemporaryTablesAreEngineWideNotPerConnection(t *testing.T) {
 	}
 	if _, err := cs[1].ExecContext(context.Background(), "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY)"); err == nil {
 		t.Fatal("a second connection created a temporary table of the same name: they are session-scoped now, so update the driver doc")
+	}
+}
+
+// The deterministic form of the same thing: a transaction that updates a row, an autocommit write from another
+// connection that commits that row first, and the transaction's commit then fails with ErrConflict (first committer
+// wins). Several connections over one engine made this reachable; the pool used to hide it by being several
+// separate engines.
+func TestATransactionLosesToAnotherConnectionsCommitOfTheSameRow(t *testing.T) {
+	expectNoLeaks(t)
+	db := openPool(t, ":memory:", 2)
+	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	sqlExec(t, db, "INSERT INTO t VALUES (1, 0)")
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("UPDATE t SET v = 100 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE t SET v = 7 WHERE id = 1"); err != nil { // another connection: the tx holds the first
+		t.Fatalf("the other connection's autocommit write: %v", err)
+	}
+	err = tx.Commit()
+	var ze *Error
+	if !errors.As(err, &ze) || ze.Kind != ErrConflict {
+		t.Fatalf("Commit = %v; want an *Error of Kind ErrConflict", err)
+	}
+	var v int
+	if err := db.QueryRow("SELECT v FROM t WHERE id = 1").Scan(&v); err != nil || v != 7 {
+		t.Fatalf("v = %d, %v; want 7 (the first committer's)", v, err)
+	}
+}
+
+// Sequence state is the engine's, not a session's: currval() on a connection returns the last value ANY connection
+// took, which makes it unusable as a way to read back what you just inserted. The driver doc says so; this keeps
+// it true (and fails, to be updated, the day the engine scopes it to the session).
+func TestCurrvalIsEngineWideNotPerConnection(t *testing.T) {
+	expectNoLeaks(t)
+	db := openPool(t, ":memory:", 2)
+	sqlExec(t, db, "CREATE SEQUENCE s")
+	cs := heldConns(t, db, 2)
+	ctx := context.Background()
+	var a, b, cur int64
+	if err := cs[0].QueryRowContext(ctx, "SELECT nextval('s')").Scan(&a); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs[1].QueryRowContext(ctx, "SELECT nextval('s')").Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs[0].QueryRowContext(ctx, "SELECT currval('s')").Scan(&cur); err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("two nextval calls returned %d twice", a)
+	}
+	if cur == a {
+		t.Fatalf("currval on the first connection is its own value (%d): it is session-scoped now, so update the driver doc", a)
+	}
+	if cur != b {
+		t.Fatalf("currval = %d; want the other connection's %d", cur, b)
+	}
+}
+
+// ---- lifecycle gaps found in review -----------------------------------------------------------------------
+
+// Closing a driver connection with a transaction open rolls it back and still counts the session out, or the engine
+// never closes (and an archive that takes the directory lock never lets go of it).
+func TestClosingADriverConnectionWithATransactionOpenCountsItOut(t *testing.T) {
+	expectNoLeaks(t)
+	c, err := Driver{}.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.(driver.ConnBeginTx).BeginTx(context.Background(), driver.TxOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The connector may be closed again after its engine is already down: nothing is closed twice.
+func TestClosingAConnectorAgainAfterItsEngineIsDownIsHarmless(t *testing.T) {
+	expectNoLeaks(t)
+	ci, err := Driver{}.OpenConnector(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := ci.(interface{ Close() error })
+	c, err := ci.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil { // the session first
+		t.Fatal(err)
+	}
+	if err := cc.Close(); err != nil { // the engine closes now
+		t.Fatal(err)
+	}
+	if err := cc.Close(); err != nil { // and again: a double zeta_close would crash or drive the counter negative
+		t.Fatal(err)
+	}
+}
+
+// A connection requested after the engine has gone down is refused, not served by reopening it.
+func TestConnectAfterTheEngineIsDownIsRefusedNotReopened(t *testing.T) {
+	expectNoLeaks(t)
+	ci, err := Driver{}.OpenConnector(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ci.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	_ = ci.(interface{ Close() error }).Close()
+	if _, err := ci.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded after the engine was closed: it was reopened behind its owner's back")
 	}
 }

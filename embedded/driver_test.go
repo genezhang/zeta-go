@@ -7,10 +7,10 @@ import (
 )
 
 // openSQLDB opens a *sql.DB through the registered "zeta" driver against an
-// in-memory database. The pool is left at its defaults: every pooled
-// connection is a session over the one engine, so they all see the same data
-// (the tests below that use db.Exec then db.Query rely on it, whichever
-// connection the pool hands out).
+// in-memory database, with the pool left at its defaults. These tests use it
+// one statement at a time, so in practice they run on one connection; pool_test.go
+// is where several connections are exercised. Were the pool to hand out another
+// connection, it would see the same data: they are all sessions over one engine.
 func openSQLDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("zeta", ":memory:")

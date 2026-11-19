@@ -19,6 +19,12 @@ import (
 // tests can assert that an engine is closed once, and only after the last connection over it.
 var liveEngines atomic.Int64
 
+// liveSessions counts the sessions the driver has opened and not yet closed, for the same tests. It catches Go-side
+// bookkeeping leaks (a close path that forgets to count a session out, so the engine never closes) on every
+// archive; it cannot see a zeta_close call that is simply omitted, which only an archive that takes the
+// data-directory lock shows.
+var liveSessions atomic.Int64
+
 // engine is the one zeta_open handle behind a pool: every database/sql connection is a zeta_connect session over
 // it, the embedded counterpart of DuckDB's connections over one database. Before this, each pooled connection
 // opened its own engine, which over a persistent path meant several engines on one data directory (the engine
@@ -69,6 +75,7 @@ func (e *engine) connect() (*conn, error) {
 		return nil, consumeErrMsg(errMsg, ErrUnknown)
 	}
 	e.sessions++
+	liveSessions.Add(1)
 	return &conn{handle: s, eng: e}, nil
 }
 
