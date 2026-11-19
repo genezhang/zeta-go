@@ -6,16 +6,17 @@ import (
 	"testing"
 )
 
-// openSQLDB opens a *sql.DB through the registered "zeta" driver against a
-// shared in-memory database (MaxOpenConns(1) so every pooled connection sees
-// the same in-memory data).
+// openSQLDB opens a *sql.DB through the registered "zeta" driver against an
+// in-memory database. The pool is left at its defaults: every pooled
+// connection is a session over the one engine, so they all see the same data
+// (the tests below that use db.Exec then db.Query rely on it, whichever
+// connection the pool hands out).
 func openSQLDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("zeta", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
