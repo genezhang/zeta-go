@@ -23,7 +23,9 @@ import (
 //
 // All operations on a Database are serialised through an internal mutex.
 // Multiple goroutines may share a Database safely; calls are executed
-// one-at-a-time. For parallelism, open separate Database handles.
+// one-at-a-time. For parallelism, give each goroutine its own session with
+// [Database.Connect]; do not Open the same persistent path twice (two engines
+// on one directory).
 type Database struct {
 	mu     sync.Mutex
 	handle *C.zeta_db_t

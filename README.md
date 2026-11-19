@@ -188,8 +188,11 @@ if errors.As(err, &ze) && ze.Kind == embedded.ErrConflict {
 ### Concurrency
 
 `*Database` is safe for concurrent use by multiple goroutines. All
-operations serialise through an internal mutex; for parallelism, open
-separate `*Database` handles.
+operations serialise through an internal mutex; for parallelism, give each
+goroutine its own session with `Connect` (reads on sessions over one engine run
+in parallel with each other). Do not `Open` a second `*Database` on the same
+persistent path for that: it is a second engine on one directory, which the
+engine says corrupts it.
 
 An open `*Rows` holds the database mutex until it is closed: every other
 call on the same `*Database` (including `Connect` and `SetBranch`) waits for
@@ -198,6 +201,38 @@ it, and from the goroutine that holds the `Rows` it never returns. Iterate
 Close. A `*Tx` locks the database only for the duration of each of its calls,
 so other calls on the same `*Database` are not held up between them; always
 defer Rollback.
+
+### `database/sql` pools
+
+`sql.Open("zeta", path)` gives a pool over **one engine**: the first connection
+opens it, and every pooled connection is a session over it (`Database.Connect`
+is the same thing in the native API). So:
+
+- A pool of any size is safe over a persistent path. Connections see each
+  other's committed writes, and reads on different connections run in
+  parallel; writes do not get faster with more connections, and one connection
+  runs one statement at a time. There is no need for `SetMaxOpenConns(1)`.
+- Writes to the **same row** from different connections at once conflict, as
+  they do between two transactions, even in autocommit: the loser gets an
+  `*Error` with `Kind == ErrConflict` and nothing is lost. So can a write to a
+  table while another connection runs DDL on it (`CREATE INDEX`, `DROP INDEX`).
+  Retry it, or serialise the writers with `SetMaxOpenConns(1)`. Writes to
+  different rows of one table do not conflict.
+- Some state belongs to the engine, not to a session: one connection's
+  `CREATE TEMP TABLE` is visible to the others until `db.Close()`, and
+  `currval()` / `lastval()` return the last value *any* connection took from the
+  sequence. Use `INSERT ... RETURNING` to read back what you inserted.
+- `":memory:"` is one database per `sql.DB`, shared by all of its connections,
+  and it lives until `db.Close()`: it survives the pool closing idle
+  connections. Two `sql.Open` calls are two databases.
+- `db.Close()` closes the engine once the last connection over it is closed.
+  The engine belongs to the `sql.DB`, so a persistent path stays open (and
+  locked, where the archive takes a data-directory lock) until then, even while
+  the pool has no open connections.
+- Do not open two `sql.DB` values, or a `sql.DB` and a `*Database`, on the same
+  persistent path in one process: that is two engines on one directory. An
+  archive that takes the data-directory lock refuses the second open with an
+  error; an older one does not, and the two are blind to each other's writes.
 
 ### Branching
 
@@ -257,8 +292,9 @@ conn.Raw(func(dc any) error { return dc.(embedded.BranchSelector).SetBranch("age
 A connection that goes back to the pool is reset to main, so a selection never reaches the next
 user of a pooled connection.
 
-A pooled connection is its own engine handle (`zeta_open`), not a `Connect` session over one
-engine. To give several callers their own branch over one engine, use `Database.Connect` as above.
+A pooled connection is a session over the pool's one engine (see [`database/sql` pools](#databasesql-pools)),
+so a branch created through the pool exists for every connection, and a selection stays on the connection
+that made it. For the native API, `Database.Connect` gives each caller its own branch the same way.
 
 ### Inspecting an embedded database with psql (dev only)
 

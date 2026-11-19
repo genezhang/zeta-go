@@ -228,7 +228,8 @@ func TestClosedHandlesRefuseBranchCalls(t *testing.T) {
 // database/sql: a branch selected on a pooled connection must not be inherited
 // by the next user of that connection.
 func TestDriverBranchSelectionDoesNotLeakThroughThePool(t *testing.T) {
-	db := openSQLDB(t) // one connection, so the same one is reused
+	db := openSQLDB(t)
+	db.SetMaxOpenConns(1) // one connection, so the same one is reused: that is what a reset is tested against
 	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	sqlExec(t, db, "INSERT INTO t VALUES (1)")
 	sqlExec(t, db, "CREATE BRANCH pooled")
