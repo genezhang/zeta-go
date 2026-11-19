@@ -3,6 +3,8 @@ package embedded
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -422,5 +424,145 @@ func TestConnectOnACancelledContextOpensNoEngine(t *testing.T) {
 	}
 	if n := liveEngines.Load() - base; n != 0 {
 		t.Fatalf("a cancelled Connect opened %d engines", n)
+	}
+}
+
+// The first connections of a pool race to open the engine; exactly one may be opened.
+func TestConcurrentFirstConnectionsOpenOneEngine(t *testing.T) {
+	base := liveEngines.Load()
+	ci, err := Driver{}.OpenConnector(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	conns := make([]interface{ Close() error }, n)
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c, err := ci.Connect(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			conns[i] = c
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if got := liveEngines.Load() - base; got != 1 {
+		t.Fatalf("%d engines after %d concurrent first Connects, want 1", got, n)
+	}
+	for _, c := range conns {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ci.(interface{ Close() error }).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveEngines.Load() - base; got != 0 {
+		t.Fatalf("%d engines remain", got)
+	}
+}
+
+// database/sql can close a driver connection twice (through sql.Conn.Raw and then normally); the engine must not be
+// told twice that a session went away, or it closes under the sessions that remain.
+func TestClosingADriverConnectionTwiceDoesNotCountItOutTwice(t *testing.T) {
+	base := liveEngines.Load()
+	db := openPool(t, ":memory:", 2)
+	cs := heldConns(t, db, 2)
+	connExec(t, cs[1], "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	if err := cs[0].Raw(func(dc any) error { return dc.(driver.Conn).Close() }); err != nil { // the first close
+		t.Fatal(err)
+	}
+	_ = cs[0].Close() // database/sql closes it again
+	if n := liveEngines.Load() - base; n != 1 {
+		t.Fatalf("%d engines, want 1", n)
+	}
+	// The other session is still open on a live engine.
+	if n := connCount(t, cs[1], "t"); n != 0 {
+		t.Fatalf("count = %d, want 0", n)
+	}
+	_ = cs[1].Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := liveEngines.Load() - base; n != 0 {
+		t.Fatalf("%d engines remain after everything closed", n)
+	}
+}
+
+// Two connections writing the same row at once is a write-write conflict, as it is between two transactions, and
+// it shows even in autocommit: the loser gets an *Error of Kind ErrConflict, nothing hangs, and nothing that was
+// reported committed is lost. (Several connections over one engine made this reachable; the pool used to hide it
+// by being several separate engines.)
+func TestConcurrentWritesToOneRowConflictCleanlyAndLoseNothing(t *testing.T) {
+	const writers, each = 4, 60
+	db := openPool(t, ":memory:", writers)
+	sqlExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	sqlExec(t, db, "INSERT INTO t VALUES (1, 0)")
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	committed, conflicts := 0, 0
+	var other error
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				_, err := db.Exec("UPDATE t SET v = v + 1 WHERE id = 1")
+				mu.Lock()
+				var ze *Error
+				switch {
+				case err == nil:
+					committed++
+				case errors.As(err, &ze) && ze.Kind == ErrConflict:
+					conflicts++
+				default:
+					other = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if other != nil {
+		t.Fatalf("a failure that is not a conflict: %v", other)
+	}
+	var v int
+	if err := db.QueryRow("SELECT v FROM t WHERE id = 1").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != committed {
+		t.Fatalf("v = %d but %d updates reported success (%d conflicts): a committed update was lost or a failed one applied", v, committed, conflicts)
+	}
+	t.Logf("%d committed, %d conflicts", committed, conflicts)
+	if committed+conflicts != writers*each {
+		t.Fatalf("%d committed + %d conflicts != %d attempts", committed, conflicts, writers*each)
+	}
+}
+
+// Temporary tables belong to the engine, not to a session: one connection's is visible to the others, and a
+// second CREATE of the same name fails. The driver doc says so; this keeps it true.
+func TestTemporaryTablesAreEngineWideNotPerConnection(t *testing.T) {
+	db := openPool(t, ":memory:", 2)
+	cs := heldConns(t, db, 2)
+	connExec(t, cs[0], "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY)")
+	connExec(t, cs[0], "INSERT INTO tt VALUES (1)")
+	if n := connCount(t, cs[1], "tt"); n != 1 {
+		t.Fatalf("the other connection sees %d rows of the temporary table, want 1", n)
+	}
+	if _, err := cs[1].ExecContext(context.Background(), "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY)"); err == nil {
+		t.Fatal("a second connection created a temporary table of the same name: they are session-scoped now, so update the driver doc")
 	}
 }

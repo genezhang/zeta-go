@@ -189,8 +189,8 @@ if errors.As(err, &ze) && ze.Kind == embedded.ErrConflict {
 
 `*Database` is safe for concurrent use by multiple goroutines. All
 operations serialise through an internal mutex; for parallelism, give each
-goroutine its own session with `Connect` (sessions over one engine run in
-parallel with each other). Do not `Open` a second `*Database` on the same
+goroutine its own session with `Connect` (reads on sessions over one engine run
+in parallel with each other). Do not `Open` a second `*Database` on the same
 persistent path for that: it is a second engine on one directory, which the
 engine says corrupts it.
 
@@ -209,9 +209,15 @@ opens it, and every pooled connection is a session over it (`Database.Connect`
 is the same thing in the native API). So:
 
 - A pool of any size is safe over a persistent path. Connections see each
-  other's committed writes, and statements on different connections run in
-  parallel; one connection runs one statement at a time. There is no need for
-  `SetMaxOpenConns(1)`.
+  other's committed writes, and reads on different connections run in
+  parallel; writes do not get faster with more connections, and one connection
+  runs one statement at a time. There is no need for `SetMaxOpenConns(1)`.
+- Writes to the **same row** from different connections at once conflict, as
+  they do between two transactions, even in autocommit: the loser gets an
+  `*Error` with `Kind == ErrConflict` and nothing is lost. Retry it, or
+  serialise the writers with `SetMaxOpenConns(1)`.
+- Temporary tables belong to the engine, not to a session: one connection's
+  `CREATE TEMP TABLE` is visible to the others until `db.Close()`.
 - `":memory:"` is one database per `sql.DB`, shared by all of its connections,
   and it lives until `db.Close()`: it survives the pool closing idle
   connections. Two `sql.Open` calls are two databases.

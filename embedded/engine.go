@@ -40,6 +40,12 @@ type engine struct {
 }
 
 // connect opens a session, opening the engine first if this is the first.
+//
+// e.mu is held across zeta_open on purpose: concurrent first connections must open ONE engine, and the others wait
+// for it. The cost is on the unhappy path only: an open that is slow (recovery of a big directory) or refused (the
+// directory lock, which retries for a few seconds) delays the connections queued behind it, and they do not see
+// their own context while they wait. The alternative (open outside the lock) lets two first connections race to
+// open two engines on one directory, which is the bug this type exists to prevent.
 func (e *engine) connect() (*conn, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

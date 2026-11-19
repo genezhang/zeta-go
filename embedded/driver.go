@@ -36,12 +36,18 @@ func init() {
 // A *sql.DB owns one engine (one in-process Zeta handle, opened by its first
 // connection), and every connection in its pool is a session over it (the
 // embedded counterpart of DuckDB's connections over one database). A session
-// has its own branch selection, transaction and error state; the storage is
-// shared. So:
+// has its own branch selection, transaction, error and changes state; the
+// storage is shared, and so are temporary tables, which belong to the engine
+// and not to a session: one connection's CREATE TEMP TABLE is visible to the
+// others until db.Close. So:
 //
 //   - A pool of any size is safe over a persistent path: every connection
 //     sees the others' committed writes, and there is one engine on the
 //     directory. SetMaxOpenConns(1) is not needed for that.
+//   - Writes to the same row from different connections at once conflict, as
+//     they do between two transactions, even in autocommit: the loser gets an
+//     *Error of Kind ErrConflict and nothing is lost. Retry it, or serialise
+//     the writers with SetMaxOpenConns(1).
 //   - ":memory:" is one database per sql.DB, shared by all its connections.
 //     It lives until db.Close, so it survives the pool closing every idle
 //     connection (SetMaxIdleConns, SetConnMaxIdleTime, SetConnMaxLifetime).
@@ -53,9 +59,9 @@ func init() {
 //     which the engine says corrupts it. An archive that takes the data
 //     directory lock refuses the second open with an error; an older one does
 //     not, and the two are blind to each other's writes.
-//   - Different connections run in parallel with each other; one connection
-//     runs one statement at a time. Give each concurrent caller its own
-//     connection (the pool does).
+//   - Reads on different connections run in parallel; writes do not get
+//     faster with more connections. One connection runs one statement at a
+//     time. Give each concurrent caller its own connection (the pool does).
 //
 // [Driver.Open], called directly rather than through sql.Open, opens a
 // connection with a private engine that closes with it.
