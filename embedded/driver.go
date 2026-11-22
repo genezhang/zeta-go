@@ -33,17 +33,49 @@ func init() {
 //
 // # Connection model
 //
-// Each database/sql connection opens its own in-process Zeta handle (the same
-// model as mattn/go-sqlite3). Two consequences worth knowing:
+// A *sql.DB owns one engine (one in-process Zeta handle, opened by its first
+// connection), and every connection in its pool is a session over it (the
+// embedded counterpart of DuckDB's connections over one database). A session
+// has its own branch selection, transaction, error and changes state; the
+// storage is shared, and so is whatever the engine keeps outside a session:
+// temporary tables are visible to every connection until db.Close, and
+// currval() and lastval() return the last value any connection took from the
+// sequence, not this connection's (use INSERT ... RETURNING to read back what
+// you inserted). So:
 //
-//   - ":memory:" databases are per-connection, so a pool of size > 1 would see
-//     independent, empty databases. Call db.SetMaxOpenConns(1) for a single
-//     shared in-memory database.
-//   - For a persistent path, set db.SetMaxOpenConns(1) if the workload needs
-//     single-writer semantics.
+//   - A pool of any size is safe over a persistent path: every connection
+//     sees the others' committed writes, and there is one engine on the
+//     directory. SetMaxOpenConns(1) is not needed for that.
+//   - Writes to the same row from different connections at once conflict, as
+//     they do between two transactions, even in autocommit: the loser gets an
+//     *Error of Kind ErrConflict and nothing is lost. So can a write to a
+//     table while another connection runs DDL on it (CREATE INDEX, DROP
+//     INDEX). Retry it, or serialise the writers with SetMaxOpenConns(1).
+//     Writes to different rows of one table do not conflict.
+//   - ":memory:" is one database per sql.DB, shared by all its connections.
+//     It lives until db.Close, so it survives the pool closing every idle
+//     connection (SetMaxIdleConns, SetConnMaxIdleTime, SetConnMaxLifetime).
+//     Two sql.Open calls are two databases.
+//   - db.Close closes the engine once the last connection over it has closed
+//     (a connection still checked out keeps it open until it is released).
+//     The engine belongs to the sql.DB, so a persistent path stays open, and
+//     locked where the archive takes a data directory lock, until db.Close
+//     even when the pool has no open connections.
+//   - Do not open two sql.DB values, or a sql.DB and a [Database], on the same
+//     persistent path in one process: that is two engines on one directory,
+//     which the engine says corrupts it. An archive that takes the data
+//     directory lock refuses the second open with an error; an older one does
+//     not, and the two are blind to each other's writes.
+//   - Reads on different connections run in parallel; writes do not get
+//     faster with more connections. One connection runs one statement at a
+//     time. Give each concurrent caller its own connection (the pool does).
 //
-// For an explicitly shared handle, the lower-level [Database] API (Open /
-// Query / Exec / Begin) remains available alongside this driver.
+// [Driver.Open], called directly rather than through sql.Open, opens a
+// connection with a private engine that closes with it.
+//
+// The lower-level [Database] API (Open / Query / Exec / Begin) remains
+// available alongside this driver; [Database.Connect] is its counterpart of a
+// pooled connection.
 //
 // # Limitations
 //
@@ -69,46 +101,36 @@ var (
 	_ driver.DriverContext = Driver{}
 )
 
-// Open opens a new connection to the database identified by dsn — a filesystem
-// path, or ":memory:".
+// Open opens a new connection to the database identified by dsn: a filesystem
+// path, or ":memory:". The connection has an engine of its own, closed with it;
+// sql.Open uses OpenConnector instead, where the connections of a pool share
+// one.
 func (Driver) Open(dsn string) (driver.Conn, error) {
-	return openConn(dsn)
-}
-
-// OpenConnector returns a connector for dsn. Each Connect opens a fresh handle.
-func (Driver) OpenConnector(dsn string) (driver.Connector, error) {
-	return connector{dsn: dsn}, nil
-}
-
-type connector struct {
-	dsn string
-}
-
-var _ driver.Connector = connector{}
-
-func (c connector) Connect(_ context.Context) (driver.Conn, error) {
-	return openConn(c.dsn)
-}
-
-func (connector) Driver() driver.Driver { return Driver{} }
-
-func openConn(dsn string) (*conn, error) {
-	cdsn := C.CString(dsn)
-	defer C.free(unsafe.Pointer(cdsn))
-
-	var errMsg *C.char
-	h := C.zeta_open(cdsn, &errMsg)
-	if h == nil {
-		return nil, consumeErrMsg(errMsg, ErrUnknown)
+	e := &engine{dsn: dsn}
+	c, err := e.connect()
+	e.release() // the connection is the engine's only owner: closing it closes the engine
+	if err != nil {
+		return nil, err
 	}
-	return &conn{handle: h}, nil
+	return c, nil
 }
 
-// conn is one Zeta connection (one open zeta_db handle). database/sql
-// guarantees a driver.Conn is used by a single goroutine at a time, so no
-// internal locking is required here.
+// OpenConnector returns a connector for dsn. Its connections are sessions over
+// one engine, opened by the first Connect and closed by the connector's Close
+// after the last connection. sql.OpenDB(connector) closes it from DB.Close; a
+// caller that uses the connector directly must close it itself (it is an
+// io.Closer), or the engine, and the data directory lock where the archive
+// takes one, stays held until the process exits.
+func (Driver) OpenConnector(dsn string) (driver.Connector, error) {
+	return &connector{eng: &engine{dsn: dsn}}, nil
+}
+
+// conn is one Zeta connection: a session (zeta_connect) over its engine.
+// database/sql guarantees a driver.Conn is used by a single goroutine at a
+// time, so no internal locking is required here.
 type conn struct {
-	handle   *C.zeta_db_t
+	handle   *C.zeta_db_t // the session; closed before the engine it came from
+	eng      *engine
 	txn      *C.zeta_txn_t // non-nil while a transaction is open
 	branched bool          // a branch is selected (see SetBranch); ResetSession clears it
 }
@@ -182,6 +204,8 @@ func (c *conn) Close() error {
 	if c.handle != nil {
 		C.zeta_close(c.handle)
 		c.handle = nil
+		liveSessions.Add(-1)
+		c.eng.sessionClosed() // after the session: the engine closes last
 	}
 	return nil
 }
