@@ -83,6 +83,9 @@ zeta-setup install -prefix $HOME/.local
 export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lgcc_s -lrt"
 ```
 
+The Linux archives from v0.1.15 on need no libstdc++ and no zlib, so neither is on these lines. An older
+archive, such as the draft `v0.1.2` release's, references zlib and needs `-lz` added.
+
 Other commands:
 
 ```bash
