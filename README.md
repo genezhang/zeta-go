@@ -80,7 +80,7 @@ Without sudo, use `-prefix`:
 ```bash
 zeta-setup install -prefix $HOME/.local
 # Linux: set before building
-export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt"
+export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lgcc_s -lrt"
 ```
 
 Other commands:
