@@ -141,7 +141,7 @@ func install(version, prefix string, force, noVerify bool) error {
 	fmt.Printf("installed zeta %s → %s\n", version, targetFile)
 	if prefix != defaultPrefix {
 		fmt.Fprintf(os.Stderr, "\nNOTE: prefix is not %s; you will need to set\n"+
-			"  CGO_LDFLAGS=\"%s -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt\"\n"+
+			"  CGO_LDFLAGS=\"%s -lpthread -ldl -lm -lgcc_s -lrt\"\n"+
 			"(or the macOS equivalent) before building against github.com/genezhang/zeta-go/embedded.\n",
 			defaultPrefix, targetFile)
 	}

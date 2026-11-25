@@ -80,8 +80,11 @@ Without sudo, use `-prefix`:
 ```bash
 zeta-setup install -prefix $HOME/.local
 # Linux: set before building
-export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lstdc++ -lgcc_s -lrt"
+export CGO_LDFLAGS="$HOME/.local/lib/zeta/libzeta.a -lpthread -ldl -lm -lgcc_s -lrt"
 ```
+
+The Linux archives from v0.1.15 on need no libstdc++ and no zlib, so neither is on these lines. An older
+archive, such as the draft `v0.1.2` release's, references zlib and needs `-lz` added.
 
 Other commands:
 
